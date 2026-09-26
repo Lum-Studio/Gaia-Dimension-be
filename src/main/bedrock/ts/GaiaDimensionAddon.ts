@@ -49,9 +49,9 @@ import { registerMagicStaffComponent } from "./items/MagicStaff.js";
 import "./items/GemstonePouch.js";
 import { initializeMagicStaffBehaviors } from "./systems/MagicStaffBehaviors.js";
 import { initializeGlitterGrassSync } from "./blocks/GlitterGrassSync.js";
-import "./world/worldgen/core/index.js";
 import "./systems/enchantments.js";
 import "./entities/MalachiteGuard.js";
+import { initializeGaiaChunkCoordinator } from "./world/GaiaChunkCoordinator.js";
 
 interface SystemShutdownBeforeEvent {
     cancel: boolean;
@@ -79,6 +79,7 @@ initializeGlitterGrassSync();
 initializeMagicStaffBehaviors();
 registerCustomTool();
 initDestroyedDimensionGuard();
+initializeGaiaChunkCoordinator();
 
 system.beforeEvents.startup.subscribe((event: StartupEvent) => {
     const { blockComponentRegistry, customCommandRegistry, itemComponentRegistry, dimensionRegistry } = event;
@@ -87,6 +88,7 @@ system.beforeEvents.startup.subscribe((event: StartupEvent) => {
     const gaiaDimId = "gaiadimension:gaia_dimension";
     dimensionRegistry.registerCustomDimension(gaiaDimId);
     registerDimension(gaiaDimId);
+    initializeGaiaChunkCoordinator();
 
     // Register dynamic realm pool (16 void dimensions)
     registerRealmDimensions(dimensionRegistry);

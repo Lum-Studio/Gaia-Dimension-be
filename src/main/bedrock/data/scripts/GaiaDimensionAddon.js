@@ -1,6 +1,6 @@
 // src/main/bedrock/ts/GaiaDimensionAddon.ts
 import {
-  system as system43
+  system as system38
 } from "@minecraft/server";
 
 // src/main/bedrock/ts/blocks/leaves.ts
@@ -5803,14 +5803,347 @@ function registerAuraShootComponent({ blockComponentRegistry }) {
 }
 
 // src/main/bedrock/ts/mixins/LightMixin.ts
-import { world as world18, system as system21, BlockPermutation as BlockPermutation11 } from "@minecraft/server";
+import { world as world19, system as system22, BlockPermutation as BlockPermutation12 } from "@minecraft/server";
 
 // src/main/bedrock/ts/world/Gaia.ts
-import { world as world17, system as system20, BlockPermutation as BlockPermutation10, BlockVolume as BlockVolume2 } from "@minecraft/server";
+import { world as world18, system as system21, BlockPermutation as BlockPermutation11, BlockVolume as BlockVolume2 } from "@minecraft/server";
+
+// src/main/bedrock/ts/world/GaiaChunkCoordinator.ts
+import {
+  world as world17,
+  system as system20,
+  BlockPermutation as BlockPermutation10
+} from "@minecraft/server";
 var GAIA_DIMENSION_ID = "gaiadimension:gaia_dimension";
+var GAIA_FEATURE_ID = "gaiadimension:gen/base/chunk_sequence";
+var SCOREBOARD_OBJECTIVE_GAIA = "gaia_chunks";
+var MAX_TICK_BUDGET_MS = 0.45;
+var MAX_PLACEMENTS_PER_TICK = 6;
+var DEFAULT_RADIUS = 3;
+var generatedChunks = /* @__PURE__ */ new Set();
+var chunkGenerationQueue = [];
+function packChunkCoords(cx, cz) {
+  const ux = BigInt.asUintN(32, BigInt(Math.floor(cx)));
+  const uz = BigInt.asUintN(32, BigInt(Math.floor(cz)));
+  return (ux | uz << 32n).toString(16);
+}
+function getScoreboardObjective() {
+  try {
+    if (!world17 || !world17.scoreboard) return null;
+    let obj = world17.scoreboard.getObjective(SCOREBOARD_OBJECTIVE_GAIA);
+    if (!obj) {
+      obj = world17.scoreboard.addObjective(SCOREBOARD_OBJECTIVE_GAIA, SCOREBOARD_OBJECTIVE_GAIA);
+    }
+    return obj ?? null;
+  } catch {
+    return null;
+  }
+}
+function isChunkGenerated(cx, cz) {
+  const memKey = `${GAIA_DIMENSION_ID}:${cx},${cz}`;
+  if (generatedChunks.has(memKey)) return true;
+  const obj = getScoreboardObjective();
+  if (!obj) return false;
+  const hexKey = packChunkCoords(cx, cz);
+  try {
+    if (typeof obj.getScore === "function") {
+      const score = obj.getScore(hexKey);
+      if (score !== void 0) {
+        generatedChunks.add(memKey);
+        return true;
+      }
+    }
+    if (typeof obj.hasParticipant === "function" && obj.hasParticipant(hexKey)) {
+      generatedChunks.add(memKey);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+function markChunkGenerated(cx, cz) {
+  const memKey = `${GAIA_DIMENSION_ID}:${cx},${cz}`;
+  generatedChunks.add(memKey);
+  const obj = getScoreboardObjective();
+  if (!obj) return;
+  const hexKey = packChunkCoords(cx, cz);
+  try {
+    obj.setScore(hexKey, 1);
+  } catch {
+  }
+}
+function isChunkPhysicallyMissing(dimension, cx, cz) {
+  if (!dimension || typeof dimension.getBlock !== "function") return false;
+  try {
+    const b = dimension.getBlock({ x: cx * 16 + 8, y: 0, z: cz * 16 + 8 });
+    return b !== void 0 && b !== null && b.typeId === "minecraft:air";
+  } catch {
+    return false;
+  }
+}
+function buildSafeLandingPlatform(dimension, x = 0, y = 65, z = 0) {
+  if (typeof x === "object" && x !== null) {
+    y = x.y !== void 0 ? x.y : 65;
+    z = x.z !== void 0 ? x.z : 0;
+    x = x.x !== void 0 ? x.x : 0;
+  }
+  const cx = Math.floor(x);
+  const cz = Math.floor(z);
+  const targetY = Math.floor(y);
+  const floorY = targetY - 1;
+  let platformPerm = null;
+  try {
+    platformPerm = BlockPermutation10.resolve("gaiadimension:agate_block");
+  } catch {
+    try {
+      platformPerm = BlockPermutation10.resolve("minecraft:obsidian");
+    } catch {
+      platformPerm = null;
+    }
+  }
+  let airPerm = null;
+  try {
+    airPerm = BlockPermutation10.resolve("minecraft:air");
+  } catch {
+    airPerm = null;
+  }
+  for (let dx = -2; dx <= 2; dx++) {
+    for (let dz = -2; dz <= 2; dz++) {
+      const bx = cx + dx;
+      const bz = cz + dz;
+      if (platformPerm) {
+        try {
+          const floorBlock = dimension.getBlock({ x: bx, y: floorY, z: bz });
+          if (floorBlock) {
+            floorBlock.setPermutation(platformPerm);
+          }
+        } catch {
+        }
+      }
+      if (airPerm) {
+        for (let dy = floorY + 1; dy <= floorY + 3; dy++) {
+          try {
+            const spaceBlock = dimension.getBlock({ x: bx, y: dy, z: bz });
+            if (spaceBlock && spaceBlock.typeId !== "minecraft:air") {
+              spaceBlock.setPermutation(airPerm);
+            }
+          } catch {
+          }
+        }
+      }
+    }
+  }
+}
+function generateSpawnTerrain(dimension, chunkCenterX = 0, chunkCenterZ = 0, chunkRadius = 2) {
+  if (!dimension || typeof dimension.placeFeature !== "function") return;
+  for (let dx = -chunkRadius; dx <= chunkRadius; dx++) {
+    for (let dz = -chunkRadius; dz <= chunkRadius; dz++) {
+      const cx = chunkCenterX + dx;
+      const cz = chunkCenterZ + dz;
+      if (isChunkGenerated(cx, cz)) {
+        if (!isChunkPhysicallyMissing(dimension, cx, cz)) {
+          continue;
+        }
+        generatedChunks.delete(`${GAIA_DIMENSION_ID}:${cx},${cz}`);
+      }
+      try {
+        const placed = dimension.placeFeature(GAIA_FEATURE_ID, { x: cx * 16, y: 0, z: cz * 16 });
+        if (placed) {
+          markChunkGenerated(cx, cz);
+        }
+      } catch {
+      }
+    }
+  }
+}
+function getClock() {
+  return typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
+}
+function updatePlayerChunks(player, radius = DEFAULT_RADIUS, tickStart = getClock(), maxBudgetMs = MAX_TICK_BUDGET_MS) {
+  if (!player || !player.isValid || !player.dimension) return 0;
+  const dim = player.dimension;
+  if (dim.id !== GAIA_DIMENSION_ID) return 0;
+  const loc = player.location;
+  if (!loc) return 0;
+  const centerChunkX = Math.floor(loc.x / 16);
+  const centerChunkZ = Math.floor(loc.z / 16);
+  if (loc.y < 0) {
+    let safeX = loc.x;
+    let safeZ = loc.z;
+    let safeY = 65;
+    generatedChunks.delete(`${GAIA_DIMENSION_ID}:${centerChunkX},${centerChunkZ}`);
+    try {
+      const placed = dim.placeFeature(GAIA_FEATURE_ID, { x: centerChunkX * 16, y: 0, z: centerChunkZ * 16 });
+      if (placed) {
+        markChunkGenerated(centerChunkX, centerChunkZ);
+      }
+    } catch {
+    }
+    try {
+      if (typeof dim.getTopmostBlock === "function") {
+        const top = dim.getTopmostBlock({ x: Math.floor(safeX), z: Math.floor(safeZ) });
+        if (top && top.location && top.location.y > 0) {
+          safeY = top.location.y + 1;
+        } else {
+          safeY = 93;
+        }
+      }
+    } catch {
+      safeY = 93;
+    }
+    if (loc.y < -15 || !isChunkGenerated(centerChunkX, centerChunkZ)) {
+      safeX = 0.5;
+      safeZ = 0.5;
+      safeY = 93;
+      try {
+        if (typeof dim.getTopmostBlock === "function") {
+          const spawnTop = dim.getTopmostBlock({ x: 0, z: 0 });
+          if (spawnTop && spawnTop.location && spawnTop.location.y > 0) {
+            safeY = spawnTop.location.y + 1;
+          }
+        }
+      } catch {
+      }
+      buildSafeLandingPlatform(dim, 0, safeY, 0);
+    }
+    try {
+      player.teleport({ x: safeX, y: safeY, z: safeZ }, { dimension: dim });
+      if (typeof player.addEffect === "function") {
+        player.addEffect("slow_falling", 60, { showParticles: false, amplifier: 0 });
+        player.addEffect("resistance", 60, { showParticles: false, amplifier: 4 });
+      }
+      if (player.onScreenDisplay && typeof player.onScreenDisplay.setActionBar === "function") {
+        player.onScreenDisplay.setActionBar("\xA7b\xA7l[GAIA ANOMALY] \xA7eSpace-time anomaly: Void fall prevented!");
+      }
+      if (typeof player.playSound === "function") {
+        player.playSound("portal.travel", { pitch: 1.8, volume: 0.7 });
+      }
+    } catch {
+    }
+  }
+  const chunkUnderneathMissing = !isChunkGenerated(centerChunkX, centerChunkZ) || isChunkPhysicallyMissing(dim, centerChunkX, centerChunkZ);
+  if (chunkUnderneathMissing) {
+    generatedChunks.delete(`${GAIA_DIMENSION_ID}:${centerChunkX},${centerChunkZ}`);
+    try {
+      const placed = dim.placeFeature(GAIA_FEATURE_ID, { x: centerChunkX * 16, y: 0, z: centerChunkZ * 16 });
+      if (placed) {
+        markChunkGenerated(centerChunkX, centerChunkZ);
+      }
+    } catch {
+    }
+    if (loc.y < 60) {
+      try {
+        if (typeof player.addEffect === "function") {
+          player.addEffect("slow_falling", 40, { showParticles: false, amplifier: 0 });
+        }
+      } catch {
+      }
+    }
+  }
+  let dirX = 0;
+  let dirZ = 0;
+  let isMoving = false;
+  try {
+    const vel = player.getVelocity?.();
+    if (vel) {
+      const speedSq = vel.x * vel.x + vel.z * vel.z;
+      if (speedSq > 5e-3) {
+        const speed = Math.sqrt(speedSq);
+        dirX = vel.x / speed;
+        dirZ = vel.z / speed;
+        isMoving = true;
+      }
+    }
+  } catch {
+    isMoving = false;
+  }
+  let minUngeneratedRing = radius + 1;
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      const cx = centerChunkX + dx;
+      const cz = centerChunkZ + dz;
+      if (!isChunkGenerated(cx, cz)) {
+        const r = Math.max(Math.abs(dx), Math.abs(dz));
+        if (r < minUngeneratedRing) {
+          minUngeneratedRing = r;
+        }
+      }
+    }
+  }
+  if (minUngeneratedRing > radius) {
+    chunkGenerationQueue.length = 0;
+    return 0;
+  }
+  const maxActiveRing = minUngeneratedRing <= 1 ? 1 : minUngeneratedRing === 2 ? 2 : radius;
+  const candidates = [];
+  for (let dx = -maxActiveRing; dx <= maxActiveRing; dx++) {
+    for (let dz = -maxActiveRing; dz <= maxActiveRing; dz++) {
+      const cx = centerChunkX + dx;
+      const cz = centerChunkZ + dz;
+      if (isChunkGenerated(cx, cz)) continue;
+      const ring = Math.max(Math.abs(dx), Math.abs(dz));
+      if (ring > maxActiveRing) continue;
+      const rawDistSq = dx * dx + dz * dz;
+      let distSq2 = ring * 1e3 + rawDistSq;
+      if (isMoving && dx * dirX + dz * dirZ > 0) {
+        distSq2 -= 10;
+      }
+      candidates[candidates.length] = { cx, cz, ring, distSq: distSq2 };
+    }
+  }
+  if (candidates.length === 0) {
+    chunkGenerationQueue.length = 0;
+    return 0;
+  }
+  candidates.sort((a, b) => a.distSq - b.distSq);
+  chunkGenerationQueue.length = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    chunkGenerationQueue[chunkGenerationQueue.length] = candidates[i];
+  }
+  let placedCount = 0;
+  for (const candidate of candidates) {
+    if (placedCount >= MAX_PLACEMENTS_PER_TICK) {
+      break;
+    }
+    if (getClock() - tickStart >= maxBudgetMs && placedCount > 0) {
+      break;
+    }
+    const { cx, cz } = candidate;
+    try {
+      const placed = dim.placeFeature(GAIA_FEATURE_ID, { x: cx * 16, y: 0, z: cz * 16 });
+      if (placed) {
+        markChunkGenerated(cx, cz);
+        placedCount++;
+      }
+    } catch {
+    }
+  }
+  return placedCount;
+}
+var coordinatorRunId = null;
+function initializeGaiaChunkCoordinator(intervalTicks = 1, radius = DEFAULT_RADIUS, maxBudgetMs = MAX_TICK_BUDGET_MS) {
+  if (coordinatorRunId !== null) return coordinatorRunId;
+  coordinatorRunId = system20.runInterval(() => {
+    const tickStart = getClock();
+    try {
+      if (!world17 || typeof world17.getAllPlayers !== "function") return;
+      const players = world17.getAllPlayers();
+      for (const player of players) {
+        if (getClock() - tickStart >= maxBudgetMs) break;
+        updatePlayerChunks(player, radius, tickStart, maxBudgetMs);
+      }
+    } catch {
+    }
+  }, intervalTicks);
+  return coordinatorRunId;
+}
+
+// src/main/bedrock/ts/world/Gaia.ts
+var GAIA_DIMENSION_ID2 = "gaiadimension:gaia_dimension";
 var DimensionSystem = class {
   static isInGaia(player) {
-    return player.dimension.id === GAIA_DIMENSION_ID;
+    return player.dimension.id === GAIA_DIMENSION_ID2;
   }
   static getBiome(player) {
     try {
@@ -5820,21 +6153,34 @@ var DimensionSystem = class {
       return "crystal_plains";
     }
   }
+  static getBiomeAt(dimension, location) {
+    try {
+      const biome = dimension.getBiome(location);
+      return biome ? biome.id.replace("minecraft:", "").replace("gaiadimension:", "") : "crystal_plains";
+    } catch (e) {
+      return "crystal_plains";
+    }
+  }
   static async teleport(player, targetDimId) {
     if (!player.isValid) return;
-    const targetDim = world17.getDimension(targetDimId);
-    const isToGaia = targetDimId === GAIA_DIMENSION_ID;
+    const targetDim = world18.getDimension(targetDimId);
+    const isToGaia = targetDimId === GAIA_DIMENSION_ID2;
     const targetX = player.location.x / (isToGaia ? 4 : 0.25);
     const targetZ = player.location.z / (isToGaia ? 4 : 0.25);
     const targetY = isToGaia ? 100 : 70;
     const spawn = { x: targetX, y: targetY, z: targetZ };
     const tickingAreaId = `teleport_${player.id}`;
     player.sendMessage(`\xA7eLoading Gaia Dimension...`);
-    await world17.tickingAreaManager.createTickingArea(tickingAreaId, {
+    await world18.tickingAreaManager.createTickingArea(tickingAreaId, {
       dimension: targetDim,
       from: { x: spawn.x - 8, y: 0, z: spawn.z - 8 },
       to: { x: spawn.x + 8, y: 128, z: spawn.z + 8 }
     });
+    if (isToGaia) {
+      const targetChunkX = Math.floor(targetX / 16);
+      const targetChunkZ = Math.floor(targetZ / 16);
+      generateSpawnTerrain(targetDim, targetChunkX, targetChunkZ, 2);
+    }
     const px = Math.floor(spawn.x);
     const py = Math.floor(spawn.y);
     const pz = Math.floor(spawn.z);
@@ -5853,30 +6199,30 @@ var DimensionSystem = class {
       targetDim.getBlock({ x: px - 1, y: py + i, z: pz })?.setType(keystone);
       targetDim.getBlock({ x: px + 2, y: py + i, z: pz })?.setType(keystone);
     }
-    const portalPerm = BlockPermutation10.resolve(portal, { "gaiadimension:perm_dim": 0 });
+    const portalPerm = BlockPermutation11.resolve(portal, { "gaiadimension:perm_dim": 0 });
     for (let ix = 0; ix <= 1; ix++) {
       for (let iy = 1; iy <= 3; iy++) {
         targetDim.getBlock({ x: px + ix, y: py + iy, z: pz })?.setPermutation(portalPerm);
       }
     }
     player.teleport({ x: px + 0.5, y: py + 1, z: pz + 0.5 }, { dimension: targetDim });
-    system20.runTimeout(() => {
+    system21.runTimeout(() => {
       try {
-        world17.tickingAreaManager.removeTickingArea(tickingAreaId);
+        world18.tickingAreaManager.removeTickingArea(tickingAreaId);
       } catch (e) {
       }
     }, 100);
   }
 };
-system20.runInterval(() => {
-  for (const player of world17.getAllPlayers()) {
+system21.runInterval(() => {
+  for (const player of world18.getAllPlayers()) {
     if (!player.isValid) continue;
     const block = player.dimension.getBlock(player.location);
     if (block && block.typeId === "gaiadimension:gaia_dimension_portal") {
       const lastTeleport = player.getDynamicProperty("last_teleport") ?? 0;
-      if (system20.currentTick - lastTeleport < 150) continue;
-      player.setDynamicProperty("last_teleport", system20.currentTick);
-      const targetDim = DimensionSystem.isInGaia(player) ? "minecraft:overworld" : GAIA_DIMENSION_ID;
+      if (system21.currentTick - lastTeleport < 150) continue;
+      player.setDynamicProperty("last_teleport", system21.currentTick);
+      const targetDim = DimensionSystem.isInGaia(player) ? "minecraft:overworld" : GAIA_DIMENSION_ID2;
       DimensionSystem.teleport(player, targetDim);
     }
   }
@@ -5884,14 +6230,14 @@ system20.runInterval(() => {
 
 // src/main/bedrock/ts/mixins/LightMixin.ts
 var lightBlockPermutation;
-system21.run(() => {
+system22.run(() => {
   try {
-    lightBlockPermutation = BlockPermutation11.resolve("minecraft:light_block", { "minecraft:block_light_level": 15 });
+    lightBlockPermutation = BlockPermutation12.resolve("minecraft:light_block", { "minecraft:block_light_level": 15 });
   } catch (e) {
   }
 });
 function initializeLightMixin() {
-  world18.afterEvents.playerPlaceBlock.subscribe((event) => {
+  world19.afterEvents.playerPlaceBlock.subscribe((event) => {
     const { block, dimension, player } = event;
     const dimId = dimension.id;
     let stateVal = 0;
@@ -5919,14 +6265,14 @@ function initializeLightMixin() {
     } catch (e) {
     }
   });
-  world18.afterEvents.playerBreakBlock.subscribe((event) => {
+  world19.afterEvents.playerBreakBlock.subscribe((event) => {
   });
 }
 
 // src/main/bedrock/ts/systems/scriptevents.ts
-import { system as system22, ItemStack as ItemStack12 } from "@minecraft/server";
+import { system as system23, ItemStack as ItemStack12 } from "@minecraft/server";
 function initializeScriptEvents() {
-  system22.afterEvents.scriptEventReceive.subscribe((event) => {
+  system23.afterEvents.scriptEventReceive.subscribe((event) => {
     if (event.id === "gaiadimension:give_agate_arrow") {
       const arrow = event.sourceEntity;
       if (!arrow) return;
@@ -5948,7 +6294,7 @@ function initializeScriptEvents() {
 }
 
 // src/main/bedrock/ts/fluids/fluids.ts
-import { world as world20, system as system24, BlockPermutation as BlockPermutation12, ItemStack as ItemStack13, BlockVolume as BlockVolume3, Player as Player17, GameMode as GameMode4 } from "@minecraft/server";
+import { world as world21, system as system25, BlockPermutation as BlockPermutation13, ItemStack as ItemStack13, BlockVolume as BlockVolume3, Player as Player18, GameMode as GameMode4 } from "@minecraft/server";
 
 // src/main/bedrock/ts/fluids/lib/FluidTemplate.ts
 var FluidTemplate = class {
@@ -6003,7 +6349,7 @@ var FogManager = class {
 };
 
 // src/main/bedrock/ts/fluids/templates/LavaTemplate.ts
-import { system as system23 } from "@minecraft/server";
+import { system as system24 } from "@minecraft/server";
 var LavaTemplate = class extends FluidTemplate {
   _ids;
   _idsSet;
@@ -6083,7 +6429,7 @@ var LavaTemplate = class extends FluidTemplate {
       });
     }
     player.setOnFire(10, true);
-    if (system23.currentTick % 20 === 0) {
+    if (system24.currentTick % 20 === 0) {
       player.applyDamage(4, { cause: "lava" });
     }
     const userFogId = "fluid_fog";
@@ -6100,7 +6446,7 @@ var LavaTemplate = class extends FluidTemplate {
       return;
     }
     entity.setOnFire(10, true);
-    if (system23.currentTick % 20 === 0) {
+    if (system24.currentTick % 20 === 0) {
       entity.applyDamage(4, { cause: "lava" });
     }
     entity.addEffect("slow_falling", 4, { amplifier: 1, showParticles: false });
@@ -6632,10 +6978,10 @@ var DIRECTIONS = [
   { x: 1, y: 0, z: 0 },
   { x: -1, y: 0, z: 0 }
 ];
-system24.runInterval(() => {
+system25.runInterval(() => {
   blockCache.clear();
   const start = Date.now();
-  const players = world20.getAllPlayers();
+  const players = world21.getAllPlayers();
   const tasks = [
     () => runPlayerEffects(players),
     () => runEntityEffects(idToTemplate, fluidIDs, players),
@@ -6653,7 +6999,7 @@ system24.runInterval(() => {
   taskIndex++;
 }, 1);
 var _fluidPosTrack = /* @__PURE__ */ new Map();
-system24.runInterval(() => {
+system25.runInterval(() => {
   for (const state of FluidTemplate.physicsStates.values()) {
     try {
       if (!state.player.isValid) {
@@ -6752,7 +7098,7 @@ function runFluidInteractionDummies(players) {
 }
 function runFluidFlowLogic(startTime) {
   if (PENDING_BLOCKS.size === 0) return;
-  const currentTick = system24.currentTick;
+  const currentTick = system25.currentTick;
   const iterator = PENDING_BLOCKS.entries();
   let processedCount = 0;
   const MAX_PER_TICK = 50;
@@ -6936,7 +7282,7 @@ function processFluidBlock(block, dimension) {
       const isAboveHalf = aboveId === baseId + "1" || aboveId === baseId + "2" || aboveId === baseId + "3";
       if (isAboveDown || isAboveHalf) {
         if (block.isValid) {
-          dimension.fillBlocks(new BlockVolume3(block.location, block.location), BlockPermutation12.resolve(baseId + "_down"));
+          dimension.fillBlocks(new BlockVolume3(block.location, block.location), BlockPermutation13.resolve(baseId + "_down"));
           changesHappened = true;
         }
         return changesHappened;
@@ -6999,7 +7345,7 @@ function processFluidBlock(block, dimension) {
       }
     }
     if (changedStates) {
-      dimension.fillBlocks(new BlockVolume3(block.location, block.location), BlockPermutation12.resolve(block.typeId, states));
+      dimension.fillBlocks(new BlockVolume3(block.location, block.location), BlockPermutation13.resolve(block.typeId, states));
     }
   }
   const below = getCachedBlock(dimension, block.location.x, block.location.y - 1, block.location.z);
@@ -7066,9 +7412,9 @@ function processFluidBlock(block, dimension) {
               else if (dir.x === 1) dirState = 7;
               else if (dir.z === 1) dirState = 5;
               else if (dir.x === -1) dirState = 3;
-              const perm = BlockPermutation12.resolve(nextStageId, { "gaiadimension:flow_dir": dirState });
+              const perm = BlockPermutation13.resolve(nextStageId, { "gaiadimension:flow_dir": dirState });
               dimension.fillBlocks(new BlockVolume3(neighbor.location, neighbor.location), perm);
-              PENDING_BLOCKS.set(`${neighbor.location.x},${neighbor.location.y},${neighbor.location.z},${dimension.id}`, { block: neighbor, dimension, scheduledTick: system24.currentTick + (template?.spreadDelay ?? 5) });
+              PENDING_BLOCKS.set(`${neighbor.location.x},${neighbor.location.y},${neighbor.location.z},${dimension.id}`, { block: neighbor, dimension, scheduledTick: system25.currentTick + (template?.spreadDelay ?? 5) });
               changesHappened = true;
             }
           }
@@ -7119,7 +7465,7 @@ function processFluidBlock(block, dimension) {
     const perms = block.permutation.getAllStates();
     if (perms["gaiadimension:flow_dir"] !== dirState) {
       perms["gaiadimension:flow_dir"] = dirState;
-      dimension.fillBlocks(new BlockVolume3(block.location, block.location), BlockPermutation12.resolve(typeId, perms));
+      dimension.fillBlocks(new BlockVolume3(block.location, block.location), BlockPermutation13.resolve(typeId, perms));
       changesHappened = true;
     }
   }
@@ -7139,11 +7485,11 @@ var FluidFlowComponent = class {
     const key = `${block.x},${block.y},${block.z},${block.dimension.id}`;
     if (STABLE_BLOCKS.has(key)) return;
     if (!PENDING_BLOCKS.has(key)) {
-      let delay2 = 5;
+      let delay = 5;
       const info = getTypeInfo(block.typeId);
       const template = idToTemplate.get(info.baseId);
-      if (template) delay2 = template.spreadDelay;
-      PENDING_BLOCKS.set(key, { block, dimension: block.dimension, scheduledTick: system24.currentTick + delay2 });
+      if (template) delay = template.spreadDelay;
+      PENDING_BLOCKS.set(key, { block, dimension: block.dimension, scheduledTick: system25.currentTick + delay });
     }
   }
 };
@@ -7151,12 +7497,12 @@ function wakeNeighbors(location, dimension) {
   const { x, y, z } = location;
   const centerBlock = getCachedBlock(dimension, x, y, z);
   if (!centerBlock) return;
-  let delay2 = 5;
+  let delay = 5;
   const info = getTypeInfo(centerBlock.typeId);
   const template = idToTemplate.get(info.baseId);
-  if (template) delay2 = template.spreadDelay;
+  if (template) delay = template.spreadDelay;
   const locations = [{ x: 0, y: 1, z: 0 }, { x: 0, y: -1, z: 0 }, { x: 1, y: 0, z: 0 }, { x: -1, y: 0, z: 0 }, { x: 0, y: 0, z: 1 }, { x: 0, y: 0, z: -1 }];
-  const scheduledTick = system24.currentTick + delay2;
+  const scheduledTick = system25.currentTick + delay;
   for (const offset of locations) {
     const nx = x + offset.x, ny = y + offset.y, nz = z + offset.z;
     const key = `${nx},${ny},${nz},${dimension.id}`;
@@ -7167,18 +7513,18 @@ function wakeNeighbors(location, dimension) {
     }
   }
 }
-world20.afterEvents.playerPlaceBlock.subscribe((e) => wakeNeighbors(e.block.location, e.block.dimension));
-world20.afterEvents.playerBreakBlock.subscribe((e) => wakeNeighbors(e.block.location, e.block.dimension));
-world20.beforeEvents.playerInteractWithBlock.subscribe((event) => {
+world21.afterEvents.playerPlaceBlock.subscribe((e) => wakeNeighbors(e.block.location, e.block.dimension));
+world21.afterEvents.playerBreakBlock.subscribe((e) => wakeNeighbors(e.block.location, e.block.dimension));
+world21.beforeEvents.playerInteractWithBlock.subscribe((event) => {
   const { player, block, itemStack } = event;
   if (!itemStack || !itemStack.typeId.startsWith("gaiadimension:") || !itemStack.typeId.endsWith("_bucket")) return;
   const fluidId = itemStack.typeId.replace("_bucket", "");
   const isFlowingVariant = (blk) => blk.typeId.startsWith(fluidId) && (blk.typeId.endsWith("_down") || /\d+$/.test(blk.typeId));
   if (isFlowingVariant(block)) {
     event.cancel = true;
-    system24.run(() => {
+    system25.run(() => {
       if (block.isValid) {
-        block.setPermutation(BlockPermutation12.resolve(fluidId));
+        block.setPermutation(BlockPermutation13.resolve(fluidId));
         wakeNeighbors(block.location, block.dimension);
         const isHot = fluidId.includes("magma") || fluidId.includes("bismuth");
         player.playSound(isHot ? "bucket.empty_lava" : "bucket.empty_water", { pitch: 1, volume: 1 });
@@ -7203,9 +7549,9 @@ world20.beforeEvents.playerInteractWithBlock.subscribe((event) => {
     return;
   }
 });
-world20.afterEvents.playerInteractWithEntity.subscribe((event) => {
+world21.afterEvents.playerInteractWithEntity.subscribe((event) => {
   const { player, target, itemStack } = event;
-  if (target.typeId !== "gaiadimension:fluid_interaction_dummy" || !(player instanceof Player17)) return;
+  if (target.typeId !== "gaiadimension:fluid_interaction_dummy" || !(player instanceof Player18)) return;
   const dimension = player.dimension;
   const location = { x: Math.floor(target.location.x), y: Math.floor(target.location.y), z: Math.floor(target.location.z) };
   const fluidBlock = getCachedBlock(dimension, location.x, location.y, location.z);
@@ -7263,7 +7609,7 @@ world20.afterEvents.playerInteractWithEntity.subscribe((event) => {
       }
     } else {
       try {
-        const perm = BlockPermutation12.resolve(itemStack.typeId);
+        const perm = BlockPermutation13.resolve(itemStack.typeId);
         if (perm) {
           dimension.fillBlocks(new BlockVolume3(location, location), perm);
           player.playSound("stone.dig", { location });
@@ -7284,8 +7630,8 @@ world20.afterEvents.playerInteractWithEntity.subscribe((event) => {
     }
   }
 });
-system24.runInterval(() => {
-  for (const player of world20.getAllPlayers()) {
+system25.runInterval(() => {
+  for (const player of world21.getAllPlayers()) {
     const container = player.getComponent("inventory")?.container;
     if (!container) continue;
     for (let i = 0; i < container.size; i++) {
@@ -7319,11 +7665,11 @@ function registerFluidComponent({ blockComponentRegistry }) {
 
 // src/main/bedrock/ts/durability.ts
 import {
-  system as system25,
+  system as system26,
   EquipmentSlot as EquipmentSlot4
 } from "@minecraft/server";
 function registerCustomTool() {
-  system25.beforeEvents.startup.subscribe((event) => {
+  system26.beforeEvents.startup.subscribe((event) => {
     event.itemComponentRegistry.registerCustomComponent("luminiae:durability", {
       onUseOn(e, params) {
         const { source, itemStack, block } = e;
@@ -7368,8 +7714,8 @@ function applyCustomDamage(player, itemStack, damageAmount) {
 
 // src/main/bedrock/ts/systems/Commands.ts
 import {
-  Player as Player19,
-  system as system26,
+  Player as Player20,
+  system as system27,
   CommandPermissionLevel,
   CustomCommandParamType
 } from "@minecraft/server";
@@ -7748,8 +8094,8 @@ function registerGaiaCommands(registry) {
     ]
   }, (origin, p1, p2, p3, p4, p5, p6, p7, p8) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       try {
         const expression = [p1, p2, p3, p4, p5, p6, p7, p8].filter((p) => p !== void 0).join(" ");
         if (!expression) {
@@ -7809,8 +8155,8 @@ function registerGaiaCommands(registry) {
     ]
   }, (origin, p1, p2, p3, p4, p5, p6, p7, p8) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       try {
         const expression = [p1, p2, p3, p4, p5, p6, p7, p8].filter((p) => p !== void 0).join(" ");
         if (!expression) {
@@ -7865,8 +8211,8 @@ function registerGaiaCommands(registry) {
     ]
   }, (origin, op, target, path, v1, v2, v3, v4, v5) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       try {
         const operation = op ? op.toLowerCase() : "get";
         const targetType = target ? target.toLowerCase() : "self";
@@ -7972,8 +8318,8 @@ function registerGaiaCommands(registry) {
     permissionLevel: CommandPermissionLevel.Any
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       player.sendMessage("\xA78\xA7l========================================");
       player.sendMessage("\xA76\xA7lGAIA DIMENSION BEDROCK PORT");
       player.sendMessage("\xA77Basked under an eternal sun, a world preserved in time, a land sprouting with crystals and minerals, the ground seeping a mysterious energy.");
@@ -7990,8 +8336,8 @@ function registerGaiaCommands(registry) {
     permissionLevel: CommandPermissionLevel.Any
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       const inGaia = DimensionSystem.isInGaia(player);
       const dimId = player.dimension.id;
       let dimensionName = "\xA77" + dimId;
@@ -8019,8 +8365,8 @@ function registerGaiaCommands(registry) {
     permissionLevel: CommandPermissionLevel.Any
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       const inGaia = DimensionSystem.isInGaia(player);
       const dimId = player.dimension.id;
       let dimensionName = "\xA77" + dimId;
@@ -8058,8 +8404,8 @@ function registerGaiaCommands(registry) {
     permissionLevel: CommandPermissionLevel.Any
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       player.sendMessage("\xA7d[Gaia Creator] \xA77She's the primordial architect who birthed the original Java realm. If you see crystals, thank her. If you see bugs, it's definitely the porter's fault.");
       player.sendMessage("\xA7b\u{1F517} https://www.curseforge.com/minecraft/mc-mods/gaia-dimension");
     });
@@ -8071,8 +8417,8 @@ function registerGaiaCommands(registry) {
     permissionLevel: CommandPermissionLevel.GameDirectors
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       const currentConfig = ModConfig.getAll();
       const form = new ModalFormData2();
       form.title("\xA76Gaia Settings");
@@ -8114,8 +8460,8 @@ function registerGaiaCommands(registry) {
     permissionLevel: CommandPermissionLevel.Any
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player19)) return { status: 0 };
-    system26.run(() => {
+    if (!(player instanceof Player20)) return { status: 0 };
+    system27.run(() => {
       player.sendMessage("\xA76[The Porter] \xA77Behold the one who dragged this entire dimension into Bedrock by its crystal ears.");
       player.sendMessage("\xA7eIt only took 4 years, three gray hairs, and a questionable amount of sanity. Don't ask why it took so long... those gray hairs are just Albite dust, I promise.");
     });
@@ -8127,7 +8473,7 @@ function formatName(id) {
 }
 
 // src/main/bedrock/ts/systems/SetBiomeCommand.ts
-import { Player as Player20, system as system27, CommandPermissionLevel as CommandPermissionLevel2, CustomCommandParamType as CustomCommandParamType2 } from "@minecraft/server";
+import { Player as Player21, system as system28, CommandPermissionLevel as CommandPermissionLevel2, CustomCommandParamType as CustomCommandParamType2 } from "@minecraft/server";
 
 // src/main/bedrock/ts/config/biome_visuals.ts
 var BIOME_VISUALS = {
@@ -8318,7 +8664,7 @@ function registerSetBiomeCommand(registry) {
     ]
   }, (origin, biome, radiusStr, shape, epic) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player20)) return;
+    if (!(player instanceof Player21)) return;
     if (!biome || !radiusStr) {
       player.sendMessage('\xA7cUsage: /gaiadimension:setbiome "biome" "radius" ["shape"] ["epic"]');
       return { status: 0 };
@@ -8381,7 +8727,7 @@ function registerSetBiomeCommand(registry) {
       }
     };
     if (!isEpic) {
-      system27.run(() => {
+      system28.run(() => {
         for (let x = -radius; x <= radius; x++) {
           for (let z = -radius; z <= radius; z++) {
             const dist = Math.sqrt(x * x + z * z);
@@ -8394,7 +8740,7 @@ function registerSetBiomeCommand(registry) {
       });
     } else {
       let currentRadius = 0;
-      const interval = system27.runInterval(() => {
+      const interval = system28.runInterval(() => {
         const r = currentRadius;
         for (let theta = 0; theta < 360; theta += 2) {
           const rad = theta * Math.PI / 180;
@@ -8409,7 +8755,7 @@ function registerSetBiomeCommand(registry) {
         }
         currentRadius++;
         if (currentRadius > radius) {
-          system27.clearRun(interval);
+          system28.clearRun(interval);
           dim.playSound("ui.toast.challenge_complete", center);
           player.sendMessage("\xA76[Gaia] \xA7aTransformation Complete.");
         }
@@ -8421,7 +8767,7 @@ function registerSetBiomeCommand(registry) {
 
 // src/main/bedrock/ts/items/FireStarter.ts
 import {
-  Player as Player21,
+  Player as Player22,
   EquipmentSlot as EquipmentSlot5,
   Direction as Direction2
 } from "@minecraft/server";
@@ -8429,7 +8775,7 @@ function registerFireStarterComponent({ itemComponentRegistry }) {
   itemComponentRegistry.registerCustomComponent("gaiadimension:fire_starter", {
     onUseOn: (event) => {
       const { source: player, block, blockFace, itemStack } = event;
-      if (!(player instanceof Player21)) return;
+      if (!(player instanceof Player22)) return;
       if (!itemStack) return;
       const targetLocation = block.location;
       const placeLocation = {
@@ -8474,9 +8820,9 @@ function registerFireStarterComponent({ itemComponentRegistry }) {
 
 // src/main/bedrock/ts/systems/DimensionDestruction.ts
 import {
-  world as world23,
-  system as system28,
-  Player as Player22,
+  world as world24,
+  system as system29,
+  Player as Player23,
   CommandPermissionLevel as CommandPermissionLevel3,
   CustomCommandParamType as CustomCommandParamType3,
   BlockVolume as BlockVolume4
@@ -8528,10 +8874,10 @@ function getAliveDimensions() {
   return getAllDimensions().filter((d) => !isDimensionDestroyed(d.id));
 }
 function isDimensionDestroyed(dimId) {
-  return world23.getDynamicProperty(`destroyed:${dimId}`) === true;
+  return world24.getDynamicProperty(`destroyed:${dimId}`) === true;
 }
 function setDimensionDestroyed(dimId, destroyed) {
-  world23.setDynamicProperty(`destroyed:${dimId}`, destroyed);
+  world24.setDynamicProperty(`destroyed:${dimId}`, destroyed);
 }
 function findFallbackDimension(excludeId) {
   return getAliveDimensions().find((d) => d.id !== excludeId);
@@ -8566,15 +8912,15 @@ function showDimensionNavigator(player) {
   });
 }
 function teleportToDimension(player, dim) {
-  system28.run(() => {
+  system29.run(() => {
     try {
-      const targetDim = world23.getDimension(dim.id);
+      const targetDim = world24.getDimension(dim.id);
       player.sendMessage(`${dim.color}\xA7l\xBB \xA7r\xA77Traversing to ${dim.color}${dim.name}\xA77...`);
       player.teleport(
         { x: player.location.x, y: 100, z: player.location.z },
         { dimension: targetDim }
       );
-      system28.runTimeout(() => {
+      system29.runTimeout(() => {
         if (player.isValid) {
           player.sendMessage(`${dim.color}\xA7l\xBB \xA7r\xA77Arrived in ${dim.color}${dim.name}\xA77.`);
         }
@@ -8639,7 +8985,7 @@ var AFTERMATH_LINES = [
   "\xA78\xA7o[The dimensional navigator will open shortly...]"
 ];
 function broadcast(msg) {
-  for (const p of world23.getAllPlayers()) {
+  for (const p of world24.getAllPlayers()) {
     if (p.isValid) p.sendMessage(msg);
   }
 }
@@ -8658,10 +9004,10 @@ var DestructionSequencer = class {
     this.dimColor = dimColor;
   }
   start() {
-    this.affectedPlayers = world23.getAllPlayers().filter((p) => p.dimension.id === this.dimId);
+    this.affectedPlayers = world24.getAllPlayers().filter((p) => p.dimension.id === this.dimId);
     broadcast(`\xA74\xA7l\u26A0 ${this.dimColor}${this.dimName} \xA74\xA7lis being obliterated... \u26A0`);
     broadcast(`\xA78\xA7oDimensional collapse initiated by \xA7f${this.player.name}`);
-    this.interval = system28.runInterval(() => {
+    this.interval = system29.runInterval(() => {
       this.tick++;
       this.processTick();
     }, 1);
@@ -8821,7 +9167,7 @@ var DestructionSequencer = class {
         if (!p.isValid) continue;
         try {
           if (fallback) {
-            const targetDim = world23.getDimension(fallback.id);
+            const targetDim = world24.getDimension(fallback.id);
             p.teleport({ x: 0, y: 100, z: 0 }, { dimension: targetDim });
           }
           p.addEffect("slow_falling", 200, { amplifier: 0, showParticles: false });
@@ -8834,7 +9180,7 @@ var DestructionSequencer = class {
       if (this.tick === 210 + i * 4) broadcast(AFTERMATH_LINES[i]);
     }
     if (this.tick === 215) {
-      for (const p of world23.getAllPlayers()) {
+      for (const p of world24.getAllPlayers()) {
         if (!p.isValid) continue;
         p.onScreenDisplay.setTitle("\xA77\xA7oThis world has been erased from existence.", {
           fadeInDuration: 20,
@@ -8847,28 +9193,28 @@ var DestructionSequencer = class {
     if (this.tick === 260) {
       for (const p of this.affectedPlayers) {
         if (p.isValid) {
-          system28.runTimeout(() => {
+          system29.runTimeout(() => {
             if (p.isValid) showDimensionNavigator(p);
           }, 20);
         }
       }
-      system28.clearRun(this.interval);
+      system29.clearRun(this.interval);
     }
   }
 };
 function initDestroyedDimensionGuard() {
-  system28.runInterval(() => {
-    for (const player of world23.getAllPlayers()) {
+  system29.runInterval(() => {
+    for (const player of world24.getAllPlayers()) {
       if (!player.isValid) continue;
       const dimId = player.dimension.id;
       if (isDimensionDestroyed(dimId)) {
         const fallback = findFallbackDimension(dimId);
         if (fallback) {
           try {
-            const targetDim = world23.getDimension(fallback.id);
+            const targetDim = world24.getDimension(fallback.id);
             player.teleport({ x: 0, y: 100, z: 0 }, { dimension: targetDim });
             player.sendMessage(`\xA74\xA7l\u26A0 \xA7c${dimId} \xA74no longer exists. \xA77You have been redirected.`);
-            system28.runTimeout(() => {
+            system29.runTimeout(() => {
               if (player.isValid) showDimensionNavigator(player);
             }, 40);
           } catch {
@@ -8896,8 +9242,8 @@ function registerDestructionCommands(registry) {
     ]
   }, (origin, dimension) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player22)) return { status: 0 };
-    system28.run(() => {
+    if (!(player instanceof Player23)) return { status: 0 };
+    system29.run(() => {
       if (!dimension) {
         player.sendMessage("\xA7cUsage: /gaiadimension:obliterate <overworld|nether|the_end|gaia>");
         return;
@@ -8936,8 +9282,8 @@ function registerDestructionCommands(registry) {
     permissionLevel: CommandPermissionLevel3.Any
   }, (origin) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player22)) return { status: 0 };
-    system28.run(() => {
+    if (!(player instanceof Player23)) return { status: 0 };
+    system29.run(() => {
       showDimensionNavigator(player);
     });
     return { status: 0 };
@@ -8951,8 +9297,8 @@ function registerDestructionCommands(registry) {
     ]
   }, (origin, dimension) => {
     const player = origin.sourceEntity;
-    if (!(player instanceof Player22)) return { status: 0 };
-    system28.run(() => {
+    if (!(player instanceof Player23)) return { status: 0 };
+    system29.run(() => {
       if (!dimension) {
         player.sendMessage("\xA7cUsage: /gaiadimension:restore <overworld|nether|the_end|gaia>");
         return;
@@ -8975,7 +9321,7 @@ function registerDestructionCommands(registry) {
         return;
       }
       setDimensionDestroyed(target.id, false);
-      for (const p of world23.getAllPlayers()) {
+      for (const p of world24.getAllPlayers()) {
         p.sendMessage(`\xA7a\xA7l\u2726 ${target.color}${target.name} \xA7a\xA7lhas been restored!`);
         p.dimension.playSound("random.levelup", p.location, { volume: 1, pitch: 1.5 });
       }
@@ -8985,10 +9331,10 @@ function registerDestructionCommands(registry) {
 }
 
 // src/main/bedrock/ts/items/MagicStaff.ts
-import { Player as Player24 } from "@minecraft/server";
+import { Player as Player25 } from "@minecraft/server";
 
 // src/main/bedrock/ts/physics/ContraptionPhysics.ts
-import { world as world24, system as system29, BlockPermutation as BlockPermutation14 } from "@minecraft/server";
+import { world as world25, system as system30, BlockPermutation as BlockPermutation15 } from "@minecraft/server";
 
 // src/main/bedrock/ts/physics/ContraptionHitbox.ts
 var PLAYER_HALF_W = 0.3;
@@ -9206,7 +9552,7 @@ var ContraptionBody = class _ContraptionBody {
         z: center.z
       });
       entity.setDynamicProperty("blockType", blockTypeId);
-      system29.run(() => {
+      system30.run(() => {
         if (entity.isValid) {
           entity.runCommand(`replaceitem entity @s slot.weapon.mainhand 0 ${blockTypeId}`);
         }
@@ -9296,7 +9642,7 @@ var ContraptionBody = class _ContraptionBody {
     this.angularVelocity.y *= ANGULAR_DAMPING;
     this._syncProperties();
     if (!this._barriersPlaced) {
-      for (const player of world24.getAllPlayers()) {
+      for (const player of world25.getAllPlayers()) {
         if (!player.isValid) continue;
         if (player.dimension.id !== this.dimension.id) continue;
         const dx = player.location.x - this.center.x;
@@ -9427,7 +9773,7 @@ var ContraptionBody = class _ContraptionBody {
       if (t.wy > maxPhantomY) maxPhantomY = t.wy;
     }
     const safeY = maxPhantomY + 1;
-    for (const player of world24.getAllPlayers()) {
+    for (const player of world25.getAllPlayers()) {
       if (!player.isValid) continue;
       if (player.dimension.id !== this.dimension.id) continue;
       const px = player.location.x;
@@ -9457,7 +9803,7 @@ var ContraptionBody = class _ContraptionBody {
           const slopeBlockId = PHANTOM_SLOPE_IDS[dirIdx];
           const slopeHi = Math.floor(slopeIdx / 16);
           const slopeLo = slopeIdx % 16;
-          const perm = BlockPermutation14.resolve(slopeBlockId, {
+          const perm = BlockPermutation15.resolve(slopeBlockId, {
             "gaiadimension:slope_hi": slopeHi,
             "gaiadimension:slope_lo": slopeLo
           });
@@ -9511,9 +9857,9 @@ var ContraptionManager = class {
   }
   static register(id, body) {
     this.active.set(id, body);
-    const tickCallback = system29.runInterval(() => {
+    const tickCallback = system30.runInterval(() => {
       if (!body.prune()) {
-        system29.clearRun(body.tickCallback);
+        system30.clearRun(body.tickCallback);
         body.destroy();
         for (const [k, v] of this.active) {
           if (v === body) this.active.delete(k);
@@ -9521,7 +9867,7 @@ var ContraptionManager = class {
         return;
       }
       if (body.state === "held") {
-        const p = world24.getAllPlayers().find((pl) => pl.id === body.holderId);
+        const p = world25.getAllPlayers().find((pl) => pl.id === body.holderId);
         if (!p) {
           body.state = "thrown";
           this.active.delete(body.holderId);
@@ -9561,7 +9907,7 @@ function registerMagicStaffComponent({ itemComponentRegistry }) {
   itemComponentRegistry.registerCustomComponent("gaiadimension:magic_staff", {
     onUse: (event) => {
       const { source: player, itemStack } = event;
-      if (!(player instanceof Player24) || !itemStack) return;
+      if (!(player instanceof Player25) || !itemStack) return;
       const idParts = itemStack.typeId.split("_");
       if (idParts.length < 4) return;
       const elementStr = idParts[2];
@@ -9675,10 +10021,10 @@ function handleForceThrow(player) {
 }
 
 // src/main/bedrock/ts/items/GemstonePouch.ts
-import { world as world27, system as system32, ItemStack as ItemStack16, EquipmentSlot as EquipmentSlot6 } from "@minecraft/server";
+import { world as world28, system as system33, ItemStack as ItemStack16, EquipmentSlot as EquipmentSlot6 } from "@minecraft/server";
 
 // src/main/bedrock/ts/API/lib/QIDB.ts
-import { world as world26, system as system31 } from "@minecraft/server";
+import { world as world27, system as system32 } from "@minecraft/server";
 function date() {
   const date2 = new Date(Date.now());
   const ms = date2.getMilliseconds().toString().padStart(3, "0");
@@ -9691,7 +10037,7 @@ var QIDB = class {
    * @param {number} saveRate the background saves per tick, (high performance impact) saveRate1 is 20 keys per second
    */
   constructor(namespace = "", cacheSize = 50, saveRate = 1) {
-    system31.run(() => {
+    system32.run(() => {
       const self = this;
       this.#settings = {
         namespace
@@ -9700,7 +10046,7 @@ var QIDB = class {
       this.#queuedValues = [];
       this.#quickAccess = /* @__PURE__ */ new Map();
       this.#validNamespace = /^[A-Za-z0-9_]*$/.test(this.#settings.namespace);
-      this.#dimension = world26.getDimension("overworld");
+      this.#dimension = world27.getDimension("overworld");
       this.logs;
       function startLog() {
         console.log(
@@ -9711,7 +10057,7 @@ var QIDB = class {
             `\xA7c\xA7lWARNING! 
 \xA7r\xA7cQIDB > using a saveRate bigger than 1 can cause slower game ticks and extreme lag while saving 1024 size keys. at <${self.#settings.namespace}> \xA7r${date()} `
           );
-          world26.getPlayers().forEach((player2) => {
+          world27.getPlayers().forEach((player2) => {
             if (player2.isOp) {
               player2.sendMessage(
                 `\xA7c\xA7lWARNING! 
@@ -9722,13 +10068,13 @@ var QIDB = class {
         }
       }
       const VALID_NAMESPACE_ERROR = new Error(`\xA7cQIDB > ${namespace} isn't a valid namespace. accepted char: A-Z a-z 0-9 _ \xA7r${date()}`);
-      let sl = world26.scoreboard.getObjective("qidb");
+      let sl = world27.scoreboard.getObjective("qidb");
       this.#sL;
-      const player = world26.getPlayers()[0];
+      const player = world27.getPlayers()[0];
       if (!this.#validNamespace) throw VALID_NAMESPACE_ERROR;
       if (player)
         if (!sl || sl?.hasParticipant("x") === false) {
-          if (!sl) sl = world26.scoreboard.addObjective("qidb");
+          if (!sl) sl = world27.scoreboard.addObjective("qidb");
           sl.setScore("x", player.location.x);
           sl.setScore("z", player.location.z);
           this.#sL = { x: sl.getScore("x"), y: 318, z: sl.getScore("z") };
@@ -9738,11 +10084,11 @@ var QIDB = class {
           this.#sL = { x: sl.getScore("x"), y: 318, z: sl.getScore("z") };
           startLog();
         }
-      world26.afterEvents.playerSpawn.subscribe(({ player: player2, initialSpawn }) => {
+      world27.afterEvents.playerSpawn.subscribe(({ player: player2, initialSpawn }) => {
         if (!this.#validNamespace) throw VALID_NAMESPACE_ERROR;
         if (!initialSpawn) return;
         if (!sl || sl?.hasParticipant("x") === false) {
-          if (!sl) sl = world26.scoreboard.addObjective("qidb");
+          if (!sl) sl = world27.scoreboard.addObjective("qidb");
           sl.setScore("x", player2.location.x);
           sl.setScore("z", player2.location.z);
           this.#sL = { x: sl.getScore("x"), y: 318, z: sl.getScore("z") };
@@ -9756,7 +10102,7 @@ var QIDB = class {
       let show = true;
       let runId;
       let lastam;
-      system31.runInterval(() => {
+      system32.runInterval(() => {
         const diff = self.#quickAccess.size - cacheSize;
         if (diff > 0) {
           for (let i = 0; i < diff; i++) {
@@ -9766,7 +10112,7 @@ var QIDB = class {
         if (self.#queuedKeys.length) {
           if (!runId) {
             log();
-            runId = system31.runInterval(() => {
+            runId = system32.runInterval(() => {
               log();
             }, 120);
           }
@@ -9778,7 +10124,7 @@ var QIDB = class {
             this.#queuedValues.shift();
           }
         } else if (runId) {
-          system31.clearRun(runId);
+          system32.clearRun(runId);
           runId = void 0;
           show == false && this.logs.save == true && console.log(`\xA7aQIDB >Saved, You can now close the world safely. \xA7r${date()}`);
           show = true;
@@ -9791,7 +10137,7 @@ var QIDB = class {
 \xA7r[Stats]-\xA7eRemaining: ${self.#queuedKeys.length} keys | speed: ${abc} keys/s \xA7r${date()}`);
         lastam = self.#queuedKeys.length;
       }
-      system31.beforeEvents.shutdown.subscribe(() => {
+      system32.beforeEvents.shutdown.subscribe(() => {
         if (this.#queuedKeys.length) {
           console.error(
             `
@@ -9834,7 +10180,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
     if (key.length > 30) throw new Error(`\xA7cQIDB > Out of range: <${key}> has more than 30 characters \xA7r${date()}`);
     let canStr = false;
     try {
-      world26.structureManager.place(key, this.#dimension, this.#sL, { includeEntities: true });
+      world27.structureManager.place(key, this.#dimension, this.#sL, { includeEntities: true });
       canStr = true;
     } catch {
       console.log(length);
@@ -9862,8 +10208,8 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
     return { canStr, invs };
   }
   async #save(key, canStr) {
-    if (canStr) world26.structureManager.delete(key);
-    world26.structureManager.createFromWorld(key, this.#dimension, this.#sL, this.#sL, { saveMode: "World", includeEntities: true });
+    if (canStr) world27.structureManager.delete(key);
+    world27.structureManager.createFromWorld(key, this.#dimension, this.#sL, this.#sL, { saveMode: "World", includeEntities: true });
     const entities = this.#dimension.getEntities({ location: this.#sL, type: "qidb:storage" });
     entities.forEach((e) => e.remove());
   }
@@ -9874,17 +10220,17 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
   async #romSave(key, value) {
     const { canStr, invs } = this.#load(key, Math.floor((value?.length - 1) / 256) + 1 || 1);
     invs.forEach((inv, index) => {
-      if (!value) for (let i = 256 * index; i < 256 * index + 256; i++) inv.setItem(i - 256 * index, void 0), world26.setDynamicProperty(key, null);
+      if (!value) for (let i = 256 * index; i < 256 * index + 256; i++) inv.setItem(i - 256 * index, void 0), world27.setDynamicProperty(key, null);
       if (Array.isArray(value)) {
         try {
           for (let i = 256 * index; i < 256 * index + 256; i++) inv.setItem(i - 256 * index, value[i] || void 0);
         } catch {
           throw new Error(`\xA7cQIDB > Invalid value type. supported: ItemStack | ItemStack[] | undefined \xA7r${date()}`);
         }
-        world26.setDynamicProperty(key, Math.floor((value?.length - 1) / 256) + 1 || 1);
+        world27.setDynamicProperty(key, Math.floor((value?.length - 1) / 256) + 1 || 1);
       } else {
         try {
-          inv.setItem(0, value), world26.setDynamicProperty(key, false);
+          inv.setItem(0, value), world27.setDynamicProperty(key, false);
         } catch {
           throw new Error(`\xA7cQIDB > Invalid value type. supported: ItemStack | ItemStack[] | undefined \xA7r${date()}`);
         }
@@ -9905,9 +10251,9 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
     key = this.#settings.namespace + ":" + key;
     if (Array.isArray(value)) {
       if (value.length > 1024) throw new Error(`\xA7cQIDB > Out of range: <${key}> has more than 1024 ItemStacks \xA7r${date()}`);
-      world26.setDynamicProperty(key, Math.floor((value?.length - 1) / 256) + 1 || 1);
+      world27.setDynamicProperty(key, Math.floor((value?.length - 1) / 256) + 1 || 1);
     } else {
-      world26.setDynamicProperty(key, false);
+      world27.setDynamicProperty(key, false);
     }
     this.#quickAccess.set(key, value);
     if (this.#queuedKeys.includes(key)) {
@@ -9933,7 +10279,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
       this.logs.get == true && console.log(`\xA7aQIDB > Got key <${key}> succesfully. ${Date.now() - time}ms \xA7r${date()}`);
       return this.#quickAccess.get(key);
     }
-    const structure = world26.structureManager.get(key);
+    const structure = world27.structureManager.get(key);
     if (!structure) throw new Error(`\xA7cQIDB > The key < ${key} > doesn't exist.`);
     const { canStr, invs } = this.#load(key);
     const items = [];
@@ -9944,7 +10290,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
     });
     this.#save(key, canStr);
     this.logs.get == true && console.log(`\xA7aQIDB > Got items from <${key}> succesfully. ${Date.now() - time}ms \xA7r${date()}`);
-    if (world26.getDynamicProperty(key)) {
+    if (world27.getDynamicProperty(key)) {
       this.#quickAccess.set(key, items);
       return items;
     } else {
@@ -9962,7 +10308,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
     if (!/^[A-Za-z0-9_]*$/.test(key)) throw new Error(`\xA7cQIDB > Invalid name: <${key}>. accepted char: A-Z a-z 0-9 _ \xA7r${date()}`);
     const time = Date.now();
     key = this.#settings.namespace + ":" + key;
-    const exist = this.#quickAccess.has(key) || world26.structureManager.get(key);
+    const exist = this.#quickAccess.has(key) || world27.structureManager.get(key);
     this.logs.has == true && console.log(`\xA7aQIDB > Found key <${key}> succesfully. ${Date.now() - time}ms \xA7r${date()}`);
     if (exist) return true;
     else return false;
@@ -9978,8 +10324,8 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
     const time = Date.now();
     key = this.#settings.namespace + ":" + key;
     if (this.#quickAccess.has(key)) this.#quickAccess.delete(key);
-    const structure = world26.structureManager.get(key);
-    if (structure) world26.structureManager.delete(key), world26.setDynamicProperty(key, null);
+    const structure = world27.structureManager.get(key);
+    if (structure) world27.structureManager.delete(key), world27.setDynamicProperty(key, null);
     else throw new Error(`\xA7cQIDB > The key <${key}> doesn't exist. \xA7r${date()}`);
     this.logs.delete == true && console.log(`\xA7aQIDB > Deleted key <${key}> succesfully. ${Date.now() - time}ms \xA7r${date()}`);
   }
@@ -9989,7 +10335,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
                       */
   keys() {
     if (!this.#validNamespace) throw new Error(`\xA7cQIDB > Invalid name: <${this.#settings.namespace}>. accepted char: A-Z a-z 0-9 _ \xA7r${date()}`);
-    const allIds = world26.getDynamicPropertyIds();
+    const allIds = world27.getDynamicPropertyIds();
     const ids = [];
     allIds.filter((id) => id.startsWith(this.#settings.namespace + ":")).forEach((id) => ids.push(id.replace(this.#settings.namespace + ":", "")));
     this.logs.keys == true && console.log(`\xA7aQIDB > Got the list of all the ${ids.length} keys. \xA7r${date()}`);
@@ -10002,7 +10348,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
   values() {
     if (!this.#validNamespace) throw new Error(`\xA7cQIDB > Invalid name: <${this.#settings.namespace}>. accepted char: A-Z a-z 0-9 _ \xA7r${date()}`);
     const time = Date.now();
-    const allIds = world26.getDynamicPropertyIds();
+    const allIds = world27.getDynamicPropertyIds();
     const values = [];
     const filtered = allIds.filter((id) => id.startsWith(this.#settings.namespace + ":")).map((id) => id.replace(this.#settings.namespace + ":", ""));
     for (const key of filtered) {
@@ -10017,7 +10363,7 @@ Lost Keys amount: ${this.#queuedKeys.length} \xA7r${date()}
   clear() {
     if (!this.#validNamespace) throw new Error(`\xA7cQIDB > Invalid name: <${this.#settings.namespace}>. accepted char: A-Z a-z 0-9 _ \xA7r${date()}`);
     const time = Date.now();
-    const allIds = world26.getDynamicPropertyIds();
+    const allIds = world27.getDynamicPropertyIds();
     const filtered = allIds.filter((id) => id.startsWith(this.#settings.namespace + ":")).map((id) => id.replace(this.#settings.namespace + ":", ""));
     for (const key of filtered) {
       this.delete(key);
@@ -10128,15 +10474,15 @@ function cleanupPouch(playerId) {
   activePouches.delete(playerId);
 }
 var spawnCooldown = /* @__PURE__ */ new Map();
-world27.beforeEvents.itemUse.subscribe((event) => {
+world28.beforeEvents.itemUse.subscribe((event) => {
   const { source: player, itemStack } = event;
   if (itemStack.typeId !== "gaiadimension:gem_pouch") return;
   const pid = player.id;
-  const currentTick = system32.currentTick || 0;
+  const currentTick = system33.currentTick || 0;
   const lastSpawn = spawnCooldown.get(pid) || 0;
   if (currentTick - lastSpawn < 10) return;
   spawnCooldown.set(pid, currentTick);
-  system32.run(() => {
+  system33.run(() => {
     const pouch = activePouches.get(pid);
     if (pouch) cleanupPouch(pid);
     const pouchId = getPouchId(itemStack);
@@ -10158,8 +10504,8 @@ world27.beforeEvents.itemUse.subscribe((event) => {
     activePouches.set(pid, { entity, pouchId });
   });
 });
-system32.runInterval(() => {
-  for (const player of world27.getAllPlayers()) {
+system33.runInterval(() => {
+  for (const player of world28.getAllPlayers()) {
     try {
       const pid = player.id;
       const equippable = player.getComponent("minecraft:equippable");
@@ -10194,7 +10540,7 @@ system32.runInterval(() => {
     }
   }
 }, 2);
-system32.runInterval(() => {
+system33.runInterval(() => {
   for (const [playerId, pouch] of activePouches) {
     const { entity } = pouch;
     if (!entity || !entity.isValid) continue;
@@ -10208,7 +10554,7 @@ system32.runInterval(() => {
         if (!ALLOWED_GEMS.has(item.typeId)) {
           container.setItem(i, void 0);
           try {
-            for (const player of world27.getAllPlayers()) {
+            for (const player of world28.getAllPlayers()) {
               if (player.id === playerId) {
                 const pInv = player.getComponent("minecraft:inventory")?.container;
                 if (pInv) {
@@ -10230,7 +10576,7 @@ system32.runInterval(() => {
           container.setItem(i, new ItemStack16(item.typeId, MAX_STACK_PER_SLOT));
           try {
             const overflowItem = new ItemStack16(item.typeId, overflow);
-            for (const player of world27.getAllPlayers()) {
+            for (const player of world28.getAllPlayers()) {
               if (player.id === playerId) {
                 const pInv = player.getComponent("minecraft:inventory")?.container;
                 if (pInv) {
@@ -10252,12 +10598,12 @@ system32.runInterval(() => {
     }
   }
 }, 5);
-world27.afterEvents.playerLeave?.subscribe((event) => {
+world28.afterEvents.playerLeave?.subscribe((event) => {
   cleanupPouch(event.playerId);
 });
 
 // src/main/bedrock/ts/systems/MagicStaffBehaviors.ts
-import { world as world28, system as system33, MolangVariableMap, Direction as Direction3 } from "@minecraft/server";
+import { world as world29, system as system34, MolangVariableMap, Direction as Direction3 } from "@minecraft/server";
 var projectileCache = /* @__PURE__ */ new Map();
 var activeProjectiles = /* @__PURE__ */ new Set();
 var ELEMENT_COLORS = {
@@ -10270,15 +10616,15 @@ var ELEMENT_COLORS = {
   [6 /* ENERGY */]: { r: 0.6, g: 0.4, b: 0.8 }
 };
 function initializeMagicStaffBehaviors() {
-  world28.afterEvents.entitySpawn.subscribe((event) => {
+  world29.afterEvents.entitySpawn.subscribe((event) => {
     if (event.entity.typeId === "gaiadimension:staff_projectile") {
       activeProjectiles.add(event.entity.id);
     }
   });
-  system33.runInterval(() => {
+  system34.runInterval(() => {
     if (activeProjectiles.size === 0) return;
     for (const id of activeProjectiles) {
-      const entity = world28.getEntity(id);
+      const entity = world29.getEntity(id);
       if (!entity || !entity.isValid) {
         activeProjectiles.delete(id);
         continue;
@@ -10298,15 +10644,15 @@ function initializeMagicStaffBehaviors() {
         activeProjectiles.delete(id);
       }
     }
-    if (system33.currentTick % 200 === 0) {
+    if (system34.currentTick % 200 === 0) {
       for (const id of projectileCache.keys()) {
-        if (!activeProjectiles.has(id) && !world28.getEntity(id)) {
+        if (!activeProjectiles.has(id) && !world29.getEntity(id)) {
           projectileCache.delete(id);
         }
       }
     }
   }, 1);
-  world28.afterEvents.projectileHitBlock.subscribe((event) => {
+  world29.afterEvents.projectileHitBlock.subscribe((event) => {
     if (event.projectile.typeId !== "gaiadimension:staff_projectile") return;
     const data = projectileCache.get(event.projectile.id);
     if (data) {
@@ -10315,7 +10661,7 @@ function initializeMagicStaffBehaviors() {
       projectileCache.delete(event.projectile.id);
     }
   });
-  world28.afterEvents.projectileHitEntity.subscribe((event) => {
+  world29.afterEvents.projectileHitEntity.subscribe((event) => {
     if (event.projectile.typeId !== "gaiadimension:staff_projectile") return;
     const data = projectileCache.get(event.projectile.id);
     if (data) {
@@ -10397,7 +10743,7 @@ function handleHit(projectile, data, location, face) {
 }
 
 // src/main/bedrock/ts/blocks/GlitterGrassSync.ts
-import { world as world29, system as system34, ItemStack as ItemStack17 } from "@minecraft/server";
+import { world as world30, system as system35, ItemStack as ItemStack17 } from "@minecraft/server";
 var GLITTER_GRASS_TYPES = [
   "gaiadimension:green_glitter_grass",
   "gaiadimension:pink_glitter_grass",
@@ -10431,13 +10777,13 @@ function syncInventory(player) {
   }
 }
 function initializeGlitterGrassSync() {
-  world29.afterEvents.playerPlaceBlock.subscribe((event) => {
+  world30.afterEvents.playerPlaceBlock.subscribe((event) => {
     const { block } = event;
     if (GLITTER_GRASS_TYPES.includes(block.typeId)) {
       const biome = DimensionSystem.getBiomeAt(block.dimension, block.location);
       const targetGrassId = BIOME_TO_GRASS[biome];
       if (targetGrassId && block.typeId !== targetGrassId) {
-        system34.run(() => {
+        system35.run(() => {
           if (block.isValid) {
             block.setType(targetGrassId);
           }
@@ -10445,14 +10791,14 @@ function initializeGlitterGrassSync() {
       }
     }
   });
-  system34.runInterval(() => {
-    for (const player of world29.getAllPlayers()) {
+  system35.runInterval(() => {
+    for (const player of world30.getAllPlayers()) {
       if (DimensionSystem.isInGaia(player)) {
         syncInventory(player);
       }
     }
   }, 40);
-  world29.afterEvents.playerInventoryItemChange.subscribe((event) => {
+  world30.afterEvents.playerInventoryItemChange.subscribe((event) => {
     const { player } = event;
     if (DimensionSystem.isInGaia(player)) {
       syncInventory(player);
@@ -10460,7118 +10806,1035 @@ function initializeGlitterGrassSync() {
   });
 }
 
-// src/main/bedrock/ts/world/worldgen/core/utils/vec3.ts
-var isVec3Symbol = /* @__PURE__ */ Symbol("isVec3");
-var Vec32 = class _Vec3 {
-  x;
-  y;
-  z;
-  // @ts-ignore
-  [isVec3Symbol] = true;
-  constructor(x = 0, y = 0, z = 0) {
-    this.x = Number(x);
-    this.y = Number(y);
-    this.z = Number(z);
-  }
-  static magnitude(vec) {
-    return Math.sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z);
-  }
-  static normalize(vec) {
-    const l = _Vec3.magnitude(vec);
-    return new _Vec3(vec.x / l, vec.y / l, vec.z / l);
-  }
-  static cross(a, b) {
-    return new _Vec3(
-      a.y * b.z - a.z * b.y,
-      a.x * b.z - a.z * b.x,
-      a.x * b.y - a.y * b.x
-    );
-  }
-  static dot(a, b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-  }
-  static angleBetween(a, b) {
-    return Math.acos(_Vec3.dot(a, b) / (_Vec3.magnitude(a) * _Vec3.magnitude(b)));
-  }
-  static subtract(a, b) {
-    return new _Vec3(a.x - b.x, a.y - b.y, a.z - b.z);
-  }
-  static add(a, b) {
-    return new _Vec3(a.x + b.x, a.y + b.y, a.z + b.z);
-  }
-  static multiply(vec, num) {
-    if (typeof num === "number") {
-      return new _Vec3(vec.x * num, vec.y * num, vec.z * num);
-    } else {
-      return new _Vec3(vec.x * num.x, vec.y * num.y, vec.z * num.z);
-    }
-  }
-  static isVec3(vec) {
-    return !!(vec && typeof vec === "object" && isVec3Symbol in vec && vec[isVec3Symbol] === true);
-  }
-  static floor(vec) {
-    return new _Vec3(Math.floor(vec.x), Math.floor(vec.y), Math.floor(vec.z));
-  }
-  static ceil(vec) {
-    return new _Vec3(Math.ceil(vec.x), Math.ceil(vec.y), Math.ceil(vec.z));
-  }
-  static projection(a, b) {
-    return _Vec3.multiply(b, _Vec3.dot(a, b) / (b.x * b.x + b.y * b.y + b.z * b.z) ** 2);
-  }
-  static rejection(a, b) {
-    return _Vec3.subtract(a, _Vec3.projection(a, b));
-  }
-  static reflect(v, n) {
-    return _Vec3.subtract(v, _Vec3.multiply(n, 2 * _Vec3.dot(v, n)));
-  }
-  static lerp(a, b, t) {
-    return _Vec3.add(_Vec3.multiply(a, 1 - t), _Vec3.multiply(b, t));
-  }
-  static distance(a, b) {
-    return _Vec3.magnitude(_Vec3.subtract(a, b));
-  }
-  static from(object) {
-    if (_Vec3.isVec3(object)) return object;
-    if (Array.isArray(object)) return new _Vec3(object[0], object[1], object[2]);
-    const { x = 0, y = 0, z = 0 } = object ?? {};
-    return new _Vec3(Number(x), Number(y), Number(z));
-  }
-  static sort(vec1, vec2) {
-    const [x1, x2] = vec1.x < vec2.x ? [vec1.x, vec2.x] : [vec2.x, vec1.x];
-    const [y1, y2] = vec1.y < vec2.y ? [vec1.y, vec2.y] : [vec2.y, vec1.y];
-    const [z1, z2] = vec1.z < vec2.z ? [vec1.z, vec2.z] : [vec2.z, vec1.z];
-    return [new _Vec3(x1, y1, z1), new _Vec3(x2, y2, z2)];
-  }
-  static invert(vec) {
-    return new _Vec3(-vec.x, -vec.y, -vec.z);
-  }
-  static get up() {
-    return new _Vec3(0, 1, 0);
-  }
-  static get down() {
-    return new _Vec3(0, -1, 0);
-  }
-  static get right() {
-    return new _Vec3(1, 0, 0);
-  }
-  static get left() {
-    return new _Vec3(-1, 0, 0);
-  }
-  static get forward() {
-    return new _Vec3(0, 0, 1);
-  }
-  static get backward() {
-    return new _Vec3(0, 0, -1);
-  }
-  static get zero() {
-    return new _Vec3(0, 0, 0);
-  }
-  distance(vec) {
-    return _Vec3.distance(this, vec);
-  }
-  lerp(vec, t) {
-    return _Vec3.lerp(this, vec, t);
-  }
-  projection(vec) {
-    return _Vec3.projection(this, vec);
-  }
-  reflect(vec) {
-    return _Vec3.reflect(this, vec);
-  }
-  rejection(vec) {
-    return _Vec3.rejection(this, vec);
-  }
-  cross(vec) {
-    return _Vec3.cross(this, vec);
-  }
-  dot(vec) {
-    return _Vec3.dot(this, vec);
-  }
-  floor() {
-    return _Vec3.floor(this);
-  }
-  ceil() {
-    return _Vec3.ceil(this);
-  }
-  add(vec) {
-    return _Vec3.add(this, vec);
-  }
-  subtract(vec) {
-    return _Vec3.subtract(this, vec);
-  }
-  multiply(num) {
-    return _Vec3.multiply(this, num);
-  }
-  get length() {
-    return _Vec3.magnitude(this);
-  }
-  get normalized() {
-    return _Vec3.normalize(this);
-  }
-  toString() {
-    return `<${this.x}, ${this.y}, ${this.z}>`;
-  }
-};
-
-// node_modules/fastnoise-lite/FastNoiseLite.js
-var FastNoiseLite = class _FastNoiseLite {
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{Cellular: string, OpenSimplex2: string, Value: string, ValueCubic: string, Perlin: string, OpenSimplex2S: string}>}
-   */
-  static NoiseType = Object.freeze({
-    OpenSimplex2: "OpenSimplex2",
-    OpenSimplex2S: "OpenSimplex2S",
-    Cellular: "Cellular",
-    Perlin: "Perlin",
-    ValueCubic: "ValueCubic",
-    Value: "Value"
-  });
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{ImproveXYPlanes: string, ImproveXZPlanes: string, None: string}>}
-   */
-  static RotationType3D = Object.freeze({
-    None: "None",
-    ImproveXYPlanes: "ImproveXYPlanes",
-    ImproveXZPlanes: "ImproveXZPlanes"
-  });
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{FBm: string, DomainWarpIndependent: string, PingPong: string, None: string, Ridged: string, DomainWarpProgressive: string}>}
-   */
-  static FractalType = Object.freeze({
-    None: "None",
-    FBm: "FBm",
-    Ridged: "Ridged",
-    PingPong: "PingPong",
-    DomainWarpProgressive: "DomainWarpProgressive",
-    DomainWarpIndependent: "DomainWarpIndependent"
-  });
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{EuclideanSq: string, Euclidean: string, Hybrid: string, Manhattan: string}>}
-   */
-  static CellularDistanceFunction = Object.freeze({
-    Euclidean: "Euclidean",
-    EuclideanSq: "EuclideanSq",
-    Manhattan: "Manhattan",
-    Hybrid: "Hybrid"
-  });
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{Distance2Sub: string, Distance2Mul: string, Distance2Add: string, Distance2Div: string, CellValue: string, Distance: string, Distance2: string}>}
-   */
-  static CellularReturnType = Object.freeze({
-    CellValue: "CellValue",
-    Distance: "Distance",
-    Distance2: "Distance2",
-    Distance2Add: "Distance2Add",
-    Distance2Sub: "Distance2Sub",
-    Distance2Mul: "Distance2Mul",
-    Distance2Div: "Distance2Div"
-  });
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{BasicGrid: string, OpenSimplex2Reduced: string, OpenSimplex2: string}>}
-   */
-  static DomainWarpType = Object.freeze({
-    OpenSimplex2: "OpenSimplex2",
-    OpenSimplex2Reduced: "OpenSimplex2Reduced",
-    BasicGrid: "BasicGrid"
-  });
-  /**
-   * @static
-   * @enum {string}
-   * @type {Readonly<{ImproveXYPlanes: string, ImproveXZPlanes: string, None: string, DefaultOpenSimplex2: string}>}
-   */
-  static TransformType3D = Object.freeze({
-    None: "None",
-    ImproveXYPlanes: "ImproveXYPlanes",
-    ImproveXZPlanes: "ImproveXZPlanes",
-    DefaultOpenSimplex2: "DefaultOpenSimplex2"
-  });
-  /* Private */
-  _Seed = 1337;
-  _Frequency = 0.01;
-  _NoiseType = _FastNoiseLite.NoiseType.OpenSimplex2;
-  _RotationType3D = _FastNoiseLite.RotationType3D.None;
-  _TransformType3D = _FastNoiseLite.TransformType3D.DefaultOpenSimplex2;
-  _DomainWarpAmp = 1;
-  _FractalType = _FastNoiseLite.FractalType.None;
-  _Octaves = 3;
-  _Lacunarity = 2;
-  _Gain = 0.5;
-  _WeightedStrength = 0;
-  _PingPongStrength = 2;
-  _FractalBounding = 1 / 1.75;
-  _CellularDistanceFunction = _FastNoiseLite.CellularDistanceFunction.EuclideanSq;
-  _CellularReturnType = _FastNoiseLite.CellularReturnType.Distance;
-  _CellularJitterModifier = 1;
-  _DomainWarpType = _FastNoiseLite.DomainWarpType.OpenSimplex2;
-  _WarpTransformType3D = _FastNoiseLite.TransformType3D.DefaultOpenSimplex2;
-  /**
-   * @description Create new FastNoiseLite object with optional seed
-   * @param {number} [seed]
-   * @constructor
-   */
-  constructor(seed2) {
-    if (seed2 !== void 0) {
-      this._Seed = seed2;
-    }
-  }
-  /**
-   * @description Sets seed used for all noise types
-   * @remarks Default: 1337
-   * @default 1337
-   * @param {number} seed
-   */
-  SetSeed(seed2) {
-    this._Seed = seed2;
-  }
-  /**
-   * @description Sets frequency for all noise types
-   * @remarks Default: 0.01
-   * @default 0.01
-   * @param {number} frequency
-   */
-  SetFrequency(frequency) {
-    this._Frequency = frequency;
-  }
-  /**
-   * @description Sets noise algorithm used for GetNoise(...)
-   * @remarks Default: OpenSimplex2
-   * @default FastNoiseLite.NoiseType.OpenSimplex2
-   * @param {FastNoiseLite.NoiseType} noiseType
-   */
-  SetNoiseType(noiseType) {
-    this._NoiseType = noiseType;
-    this._UpdateTransformType3D();
-  }
-  /**
-   * @description Sets domain rotation type for 3D Noise and 3D DomainWarp.
-   * @description Can aid in reducing directional artifacts when sampling a 2D plane in 3D
-   * @remarks Default: None
-   * @default FastNoiseLite.RotationType3D.None
-   * @param {FastNoiseLite.RotationType3D} rotationType3D
-   */
-  SetRotationType3D(rotationType3D) {
-    this._RotationType3D = rotationType3D;
-    this._UpdateTransformType3D();
-    this._UpdateWarpTransformType3D();
-  }
-  /**
-   * @description Sets method for combining octaves in all fractal noise types
-   * @remarks Default: None
-   * @default FastNoiseLite.FractalType.None
-   * @param {FastNoiseLite.FractalType} fractalType
-   */
-  SetFractalType(fractalType) {
-    this._FractalType = fractalType;
-  }
-  /**
-   * @description Sets octave count for all fractal noise types
-   * @remarks Default: 3
-   * @default 3
-   * @param {number} octaves
-   */
-  SetFractalOctaves(octaves) {
-    this._Octaves = octaves;
-    this._CalculateFractalBounding();
-  }
-  /**
-   * @description Sets octave lacunarity for all fractal noise types
-   * @remarks Default: 2.0
-   * @default 2.0
-   * @param {number} lacunarity
-   */
-  SetFractalLacunarity(lacunarity) {
-    this._Lacunarity = lacunarity;
-  }
-  /**
-   * @description Sets octave gain for all fractal noise types
-   * @remarks Default: 0.5
-   * @default 0.5
-   * @param {number} gain
-   */
-  SetFractalGain(gain) {
-    this._Gain = gain;
-    this._CalculateFractalBounding();
-  }
-  /**
-   * @description Sets octave weighting for all none DomainWarp fratal types
-   * @remarks Default: 0.0 | Keep between 0...1 to maintain -1...1 output bounding
-   * @default 0.5
-   * @param {number} weightedStrength
-   */
-  SetFractalWeightedStrength(weightedStrength) {
-    this._WeightedStrength = weightedStrength;
-  }
-  /**
-   * @description Sets strength of the fractal ping pong effect
-   * @remarks Default: 2.0
-   * @default 2.0
-   * @param {number} pingPongStrength
-   */
-  SetFractalPingPongStrength(pingPongStrength) {
-    this._PingPongStrength = pingPongStrength;
-  }
-  /**
-   * @description Sets distance function used in cellular noise calculations
-   * @remarks Default: EuclideanSq
-   * @default FastNoiseLite.CellularDistanceFunction.EuclideanSq
-   * @param {FastNoiseLite.CellularDistanceFunction} cellularDistanceFunction
-   */
-  SetCellularDistanceFunction(cellularDistanceFunction) {
-    this._CellularDistanceFunction = cellularDistanceFunction;
-  }
-  /**
-   * @description Sets return type from cellular noise calculations
-   * @remarks Default: Distance
-   * @default FastNoiseLite.CellularReturnType.Distance
-   * @param {FastNoiseLite.CellularReturnType} cellularReturnType
-   */
-  SetCellularReturnType(cellularReturnType) {
-    this._CellularReturnType = cellularReturnType;
-  }
-  /**
-   * @description Sets the maximum distance a cellular point can move from it's grid position
-   * @remarks Default: 1.0
-   * @default 1.0
-   * @param {number} cellularJitter
-   */
-  SetCellularJitter(cellularJitter) {
-    this._CellularJitterModifier = cellularJitter;
-  }
-  /**
-   * @description Sets the warp algorithm when using DomainWarp(...)
-   * @remarks Default: OpenSimplex2
-   * @default FastNoiseLite.DomainWarpType.OpenSimplex2
-   * @param {FastNoiseLite.DomainWarpType} domainWarpType
-   */
-  SetDomainWarpType(domainWarpType) {
-    this._DomainWarpType = domainWarpType;
-    this._UpdateWarpTransformType3D();
-  }
-  /**
-   * @description Sets the maximum warp distance from original position when using DomainWarp(...)
-   * @remarks Default: 1.0
-   * @default 1.0
-   * @param {number} domainWarpAmp
-   */
-  SetDomainWarpAmp(domainWarpAmp) {
-    this._DomainWarpAmp = domainWarpAmp;
-  }
-  /**
-   * @description 2D/3D noise at given position using current settings
-   * @param {number} x X coordinate
-   * @param {number} y Y coordinate
-   * @param {number} [z] Z coordinate
-   * @return {number} Noise output bounded between -1...1
-   */
-  GetNoise(x, y, z) {
-    let R2 = (x2, y2) => {
-      x2 *= this._Frequency;
-      y2 *= this._Frequency;
-      switch (this._NoiseType) {
-        case _FastNoiseLite.NoiseType.OpenSimplex2:
-        case _FastNoiseLite.NoiseType.OpenSimplex2S:
-          const SQRT3 = 1.7320508075688772;
-          const F2 = 0.5 * (SQRT3 - 1);
-          let t = (x2 + y2) * F2;
-          x2 += t;
-          y2 += t;
-          break;
-        default:
-          break;
-      }
-      switch (this._FractalType) {
-        default:
-          return this._GenNoiseSingleR2(this._Seed, x2, y2);
-        case _FastNoiseLite.FractalType.FBm:
-          return this._GenFractalFBmR2(x2, y2);
-        case _FastNoiseLite.FractalType.Ridged:
-          return this._GenFractalRidgedR2(x2, y2);
-        case _FastNoiseLite.FractalType.PingPong:
-          return this._GenFractalPingPongR2(x2, y2);
-      }
-    };
-    let R3 = (x2, y2, z2) => {
-      x2 *= this._Frequency;
-      y2 *= this._Frequency;
-      z2 *= this._Frequency;
-      switch (this._TransformType3D) {
-        case _FastNoiseLite.TransformType3D.ImproveXYPlanes: {
-          let xy = x2 + y2;
-          let s2 = xy * -0.211324865405187;
-          z2 *= 0.577350269189626;
-          x2 += s2 - z2;
-          y2 += s2 - z2;
-          z2 += xy * 0.577350269189626;
-          break;
-        }
-        case _FastNoiseLite.TransformType3D.ImproveXZPlanes: {
-          let xz = x2 + z2;
-          let s2 = xz * -0.211324865405187;
-          y2 *= 0.577350269189626;
-          x2 += s2 - y2;
-          z2 += s2 - y2;
-          y2 += xz * 0.577350269189626;
-          break;
-        }
-        case _FastNoiseLite.TransformType3D.DefaultOpenSimplex2:
-          const R32 = 2 / 3;
-          let r = (x2 + y2 + z2) * R32;
-          x2 = r - x2;
-          y2 = r - y2;
-          z2 = r - z2;
-          break;
-        default:
-          break;
-      }
-      switch (this._FractalType) {
-        default:
-          return this._GenNoiseSingleR3(this._Seed, x2, y2, z2);
-        case _FastNoiseLite.FractalType.FBm:
-          return this._GenFractalFBmR3(x2, y2, z2);
-        case _FastNoiseLite.FractalType.Ridged:
-          return this._GenFractalRidgedR3(x2, y2, z2);
-        case _FastNoiseLite.FractalType.PingPong:
-          return this._GenFractalPingPongR3(x2, y2, z2);
-      }
-    };
-    if (arguments.length === 2) {
-      return R2(x, y);
-    }
-    if (arguments.length === 3) {
-      return R3(x, y, z);
-    }
-  }
-  /**
-   * @description 2D/3D warps the input position using current domain warp settings
-   * @param {Vector2|Vector3} coord
-   */
-  DomainWrap(coord) {
-    switch (this._FractalType) {
-      default:
-        this._DomainWarpSingle(coord);
-        break;
-      case _FastNoiseLite.FractalType.DomainWarpProgressive:
-        this._DomainWarpFractalProgressive(coord);
-        break;
-      case _FastNoiseLite.FractalType.DomainWarpIndependent:
-        this._DomainWarpFractalIndependent(coord);
-        break;
-    }
-  }
-  // prettier-ignore
-  _Gradients2D = [
-    0.130526192220052,
-    0.99144486137381,
-    0.38268343236509,
-    0.923879532511287,
-    0.608761429008721,
-    0.793353340291235,
-    0.793353340291235,
-    0.608761429008721,
-    0.923879532511287,
-    0.38268343236509,
-    0.99144486137381,
-    0.130526192220051,
-    0.99144486137381,
-    -0.130526192220051,
-    0.923879532511287,
-    -0.38268343236509,
-    0.793353340291235,
-    -0.60876142900872,
-    0.608761429008721,
-    -0.793353340291235,
-    0.38268343236509,
-    -0.923879532511287,
-    0.130526192220052,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    -0.38268343236509,
-    -0.923879532511287,
-    -0.608761429008721,
-    -0.793353340291235,
-    -0.793353340291235,
-    -0.608761429008721,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    0.130526192220051,
-    -0.923879532511287,
-    0.38268343236509,
-    -0.793353340291235,
-    0.608761429008721,
-    -0.608761429008721,
-    0.793353340291235,
-    -0.38268343236509,
-    0.923879532511287,
-    -0.130526192220052,
-    0.99144486137381,
-    0.130526192220052,
-    0.99144486137381,
-    0.38268343236509,
-    0.923879532511287,
-    0.608761429008721,
-    0.793353340291235,
-    0.793353340291235,
-    0.608761429008721,
-    0.923879532511287,
-    0.38268343236509,
-    0.99144486137381,
-    0.130526192220051,
-    0.99144486137381,
-    -0.130526192220051,
-    0.923879532511287,
-    -0.38268343236509,
-    0.793353340291235,
-    -0.60876142900872,
-    0.608761429008721,
-    -0.793353340291235,
-    0.38268343236509,
-    -0.923879532511287,
-    0.130526192220052,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    -0.38268343236509,
-    -0.923879532511287,
-    -0.608761429008721,
-    -0.793353340291235,
-    -0.793353340291235,
-    -0.608761429008721,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    0.130526192220051,
-    -0.923879532511287,
-    0.38268343236509,
-    -0.793353340291235,
-    0.608761429008721,
-    -0.608761429008721,
-    0.793353340291235,
-    -0.38268343236509,
-    0.923879532511287,
-    -0.130526192220052,
-    0.99144486137381,
-    0.130526192220052,
-    0.99144486137381,
-    0.38268343236509,
-    0.923879532511287,
-    0.608761429008721,
-    0.793353340291235,
-    0.793353340291235,
-    0.608761429008721,
-    0.923879532511287,
-    0.38268343236509,
-    0.99144486137381,
-    0.130526192220051,
-    0.99144486137381,
-    -0.130526192220051,
-    0.923879532511287,
-    -0.38268343236509,
-    0.793353340291235,
-    -0.60876142900872,
-    0.608761429008721,
-    -0.793353340291235,
-    0.38268343236509,
-    -0.923879532511287,
-    0.130526192220052,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    -0.38268343236509,
-    -0.923879532511287,
-    -0.608761429008721,
-    -0.793353340291235,
-    -0.793353340291235,
-    -0.608761429008721,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    0.130526192220051,
-    -0.923879532511287,
-    0.38268343236509,
-    -0.793353340291235,
-    0.608761429008721,
-    -0.608761429008721,
-    0.793353340291235,
-    -0.38268343236509,
-    0.923879532511287,
-    -0.130526192220052,
-    0.99144486137381,
-    0.130526192220052,
-    0.99144486137381,
-    0.38268343236509,
-    0.923879532511287,
-    0.608761429008721,
-    0.793353340291235,
-    0.793353340291235,
-    0.608761429008721,
-    0.923879532511287,
-    0.38268343236509,
-    0.99144486137381,
-    0.130526192220051,
-    0.99144486137381,
-    -0.130526192220051,
-    0.923879532511287,
-    -0.38268343236509,
-    0.793353340291235,
-    -0.60876142900872,
-    0.608761429008721,
-    -0.793353340291235,
-    0.38268343236509,
-    -0.923879532511287,
-    0.130526192220052,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    -0.38268343236509,
-    -0.923879532511287,
-    -0.608761429008721,
-    -0.793353340291235,
-    -0.793353340291235,
-    -0.608761429008721,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    0.130526192220051,
-    -0.923879532511287,
-    0.38268343236509,
-    -0.793353340291235,
-    0.608761429008721,
-    -0.608761429008721,
-    0.793353340291235,
-    -0.38268343236509,
-    0.923879532511287,
-    -0.130526192220052,
-    0.99144486137381,
-    0.130526192220052,
-    0.99144486137381,
-    0.38268343236509,
-    0.923879532511287,
-    0.608761429008721,
-    0.793353340291235,
-    0.793353340291235,
-    0.608761429008721,
-    0.923879532511287,
-    0.38268343236509,
-    0.99144486137381,
-    0.130526192220051,
-    0.99144486137381,
-    -0.130526192220051,
-    0.923879532511287,
-    -0.38268343236509,
-    0.793353340291235,
-    -0.60876142900872,
-    0.608761429008721,
-    -0.793353340291235,
-    0.38268343236509,
-    -0.923879532511287,
-    0.130526192220052,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    -0.38268343236509,
-    -0.923879532511287,
-    -0.608761429008721,
-    -0.793353340291235,
-    -0.793353340291235,
-    -0.608761429008721,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.99144486137381,
-    -0.130526192220052,
-    -0.99144486137381,
-    0.130526192220051,
-    -0.923879532511287,
-    0.38268343236509,
-    -0.793353340291235,
-    0.608761429008721,
-    -0.608761429008721,
-    0.793353340291235,
-    -0.38268343236509,
-    0.923879532511287,
-    -0.130526192220052,
-    0.99144486137381,
-    0.38268343236509,
-    0.923879532511287,
-    0.923879532511287,
-    0.38268343236509,
-    0.923879532511287,
-    -0.38268343236509,
-    0.38268343236509,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.923879532511287,
-    -0.923879532511287,
-    -0.38268343236509,
-    -0.923879532511287,
-    0.38268343236509,
-    -0.38268343236509,
-    0.923879532511287
-  ];
-  // prettier-ignore
-  _RandVecs2D = [
-    -0.2700222198,
-    -0.9628540911,
-    0.3863092627,
-    -0.9223693152,
-    0.04444859006,
-    -0.999011673,
-    -0.5992523158,
-    -0.8005602176,
-    -0.7819280288,
-    0.6233687174,
-    0.9464672271,
-    0.3227999196,
-    -0.6514146797,
-    -0.7587218957,
-    0.9378472289,
-    0.347048376,
-    -0.8497875957,
-    -0.5271252623,
-    -0.879042592,
-    0.4767432447,
-    -0.892300288,
-    -0.4514423508,
-    -0.379844434,
-    -0.9250503802,
-    -0.9951650832,
-    0.0982163789,
-    0.7724397808,
-    -0.6350880136,
-    0.7573283322,
-    -0.6530343002,
-    -0.9928004525,
-    -0.119780055,
-    -0.0532665713,
-    0.9985803285,
-    0.9754253726,
-    -0.2203300762,
-    -0.7665018163,
-    0.6422421394,
-    0.991636706,
-    0.1290606184,
-    -0.994696838,
-    0.1028503788,
-    -0.5379205513,
-    -0.84299554,
-    0.5022815471,
-    -0.8647041387,
-    0.4559821461,
-    -0.8899889226,
-    -0.8659131224,
-    -0.5001944266,
-    0.0879458407,
-    -0.9961252577,
-    -0.5051684983,
-    0.8630207346,
-    0.7753185226,
-    -0.6315704146,
-    -0.6921944612,
-    0.7217110418,
-    -0.5191659449,
-    -0.8546734591,
-    0.8978622882,
-    -0.4402764035,
-    -0.1706774107,
-    0.9853269617,
-    -0.9353430106,
-    -0.3537420705,
-    -0.9992404798,
-    0.03896746794,
-    -0.2882064021,
-    -0.9575683108,
-    -0.9663811329,
-    0.2571137995,
-    -0.8759714238,
-    -0.4823630009,
-    -0.8303123018,
-    -0.5572983775,
-    0.05110133755,
-    -0.9986934731,
-    -0.8558373281,
-    -0.5172450752,
-    0.09887025282,
-    0.9951003332,
-    0.9189016087,
-    0.3944867976,
-    -0.2439375892,
-    -0.9697909324,
-    -0.8121409387,
-    -0.5834613061,
-    -0.9910431363,
-    0.1335421355,
-    0.8492423985,
-    -0.5280031709,
-    -0.9717838994,
-    -0.2358729591,
-    0.9949457207,
-    0.1004142068,
-    0.6241065508,
-    -0.7813392434,
-    0.662910307,
-    0.7486988212,
-    -0.7197418176,
-    0.6942418282,
-    -0.8143370775,
-    -0.5803922158,
-    0.104521054,
-    -0.9945226741,
-    -0.1065926113,
-    -0.9943027784,
-    0.445799684,
-    -0.8951327509,
-    0.105547406,
-    0.9944142724,
-    -0.992790267,
-    0.1198644477,
-    -0.8334366408,
-    0.552615025,
-    0.9115561563,
-    -0.4111755999,
-    0.8285544909,
-    -0.5599084351,
-    0.7217097654,
-    -0.6921957921,
-    0.4940492677,
-    -0.8694339084,
-    -0.3652321272,
-    -0.9309164803,
-    -0.9696606758,
-    0.2444548501,
-    0.08925509731,
-    -0.996008799,
-    0.5354071276,
-    -0.8445941083,
-    -0.1053576186,
-    0.9944343981,
-    -0.9890284586,
-    0.1477251101,
-    0.004856104961,
-    0.9999882091,
-    0.9885598478,
-    0.1508291331,
-    0.9286129562,
-    -0.3710498316,
-    -0.5832393863,
-    -0.8123003252,
-    0.3015207509,
-    0.9534596146,
-    -0.9575110528,
-    0.2883965738,
-    0.9715802154,
-    -0.2367105511,
-    0.229981792,
-    0.9731949318,
-    0.955763816,
-    -0.2941352207,
-    0.740956116,
-    0.6715534485,
-    -0.9971513787,
-    -0.07542630764,
-    0.6905710663,
-    -0.7232645452,
-    -0.290713703,
-    -0.9568100872,
-    0.5912777791,
-    -0.8064679708,
-    -0.9454592212,
-    -0.325740481,
-    0.6664455681,
-    0.74555369,
-    0.6236134912,
-    0.7817328275,
-    0.9126993851,
-    -0.4086316587,
-    -0.8191762011,
-    0.5735419353,
-    -0.8812745759,
-    -0.4726046147,
-    0.9953313627,
-    0.09651672651,
-    0.9855650846,
-    -0.1692969699,
-    -0.8495980887,
-    0.5274306472,
-    0.6174853946,
-    -0.7865823463,
-    0.8508156371,
-    0.52546432,
-    0.9985032451,
-    -0.05469249926,
-    0.1971371563,
-    -0.9803759185,
-    0.6607855748,
-    -0.7505747292,
-    -0.03097494063,
-    0.9995201614,
-    -0.6731660801,
-    0.739491331,
-    -0.7195018362,
-    -0.6944905383,
-    0.9727511689,
-    0.2318515979,
-    0.9997059088,
-    -0.0242506907,
-    0.4421787429,
-    -0.8969269532,
-    0.9981350961,
-    -0.061043673,
-    -0.9173660799,
-    -0.3980445648,
-    -0.8150056635,
-    -0.5794529907,
-    -0.8789331304,
-    0.4769450202,
-    0.0158605829,
-    0.999874213,
-    -0.8095464474,
-    0.5870558317,
-    -0.9165898907,
-    -0.3998286786,
-    -0.8023542565,
-    0.5968480938,
-    -0.5176737917,
-    0.8555780767,
-    -0.8154407307,
-    -0.5788405779,
-    0.4022010347,
-    -0.9155513791,
-    -0.9052556868,
-    -0.4248672045,
-    0.7317445619,
-    0.6815789728,
-    -0.5647632201,
-    -0.8252529947,
-    -0.8403276335,
-    -0.5420788397,
-    -0.9314281527,
-    0.363925262,
-    0.5238198472,
-    0.8518290719,
-    0.7432803869,
-    -0.6689800195,
-    -0.985371561,
-    -0.1704197369,
-    0.4601468731,
-    0.88784281,
-    0.825855404,
-    0.5638819483,
-    0.6182366099,
-    0.7859920446,
-    0.8331502863,
-    -0.553046653,
-    0.1500307506,
-    0.9886813308,
-    -0.662330369,
-    -0.7492119075,
-    -0.668598664,
-    0.743623444,
-    0.7025606278,
-    0.7116238924,
-    -0.5419389763,
-    -0.8404178401,
-    -0.3388616456,
-    0.9408362159,
-    0.8331530315,
-    0.5530425174,
-    -0.2989720662,
-    -0.9542618632,
-    0.2638522993,
-    0.9645630949,
-    0.124108739,
-    -0.9922686234,
-    -0.7282649308,
-    -0.6852956957,
-    0.6962500149,
-    0.7177993569,
-    -0.9183535368,
-    0.3957610156,
-    -0.6326102274,
-    -0.7744703352,
-    -0.9331891859,
-    -0.359385508,
-    -0.1153779357,
-    -0.9933216659,
-    0.9514974788,
-    -0.3076565421,
-    -0.08987977445,
-    -0.9959526224,
-    0.6678496916,
-    0.7442961705,
-    0.7952400393,
-    -0.6062947138,
-    -0.6462007402,
-    -0.7631674805,
-    -0.2733598753,
-    0.9619118351,
-    0.9669590226,
-    -0.254931851,
-    -0.9792894595,
-    0.2024651934,
-    -0.5369502995,
-    -0.8436138784,
-    -0.270036471,
-    -0.9628500944,
-    -0.6400277131,
-    0.7683518247,
-    -0.7854537493,
-    -0.6189203566,
-    0.06005905383,
-    -0.9981948257,
-    -0.02455770378,
-    0.9996984141,
-    -0.65983623,
-    0.751409442,
-    -0.6253894466,
-    -0.7803127835,
-    -0.6210408851,
-    -0.7837781695,
-    0.8348888491,
-    0.5504185768,
-    -0.1592275245,
-    0.9872419133,
-    0.8367622488,
-    0.5475663786,
-    -0.8675753916,
-    -0.4973056806,
-    -0.2022662628,
-    -0.9793305667,
-    0.9399189937,
-    0.3413975472,
-    0.9877404807,
-    -0.1561049093,
-    -0.9034455656,
-    0.4287028224,
-    0.1269804218,
-    -0.9919052235,
-    -0.3819600854,
-    0.924178821,
-    0.9754625894,
-    0.2201652486,
-    -0.3204015856,
-    -0.9472818081,
-    -0.9874760884,
-    0.1577687387,
-    0.02535348474,
-    -0.9996785487,
-    0.4835130794,
-    -0.8753371362,
-    -0.2850799925,
-    -0.9585037287,
-    -0.06805516006,
-    -0.99768156,
-    -0.7885244045,
-    -0.6150034663,
-    0.3185392127,
-    -0.9479096845,
-    0.8880043089,
-    0.4598351306,
-    0.6476921488,
-    -0.7619021462,
-    0.9820241299,
-    0.1887554194,
-    0.9357275128,
-    -0.3527237187,
-    -0.8894895414,
-    0.4569555293,
-    0.7922791302,
-    0.6101588153,
-    0.7483818261,
-    0.6632681526,
-    -0.7288929755,
-    -0.6846276581,
-    0.8729032783,
-    -0.4878932944,
-    0.8288345784,
-    0.5594937369,
-    0.08074567077,
-    0.9967347374,
-    0.9799148216,
-    -0.1994165048,
-    -0.580730673,
-    -0.8140957471,
-    -0.4700049791,
-    -0.8826637636,
-    0.2409492979,
-    0.9705377045,
-    0.9437816757,
-    -0.3305694308,
-    -0.8927998638,
-    -0.4504535528,
-    -0.8069622304,
-    0.5906030467,
-    0.06258973166,
-    0.9980393407,
-    -0.9312597469,
-    0.3643559849,
-    0.5777449785,
-    0.8162173362,
-    -0.3360095855,
-    -0.941858566,
-    0.697932075,
-    -0.7161639607,
-    -0.002008157227,
-    -0.9999979837,
-    -0.1827294312,
-    -0.9831632392,
-    -0.6523911722,
-    0.7578824173,
-    -0.4302626911,
-    -0.9027037258,
-    -0.9985126289,
-    -0.05452091251,
-    -0.01028102172,
-    -0.9999471489,
-    -0.4946071129,
-    0.8691166802,
-    -0.2999350194,
-    0.9539596344,
-    0.8165471961,
-    0.5772786819,
-    0.2697460475,
-    0.962931498,
-    -0.7306287391,
-    -0.6827749597,
-    -0.7590952064,
-    -0.6509796216,
-    -0.907053853,
-    0.4210146171,
-    -0.5104861064,
-    -0.8598860013,
-    0.8613350597,
-    0.5080373165,
-    0.5007881595,
-    -0.8655698812,
-    -0.654158152,
-    0.7563577938,
-    -0.8382755311,
-    -0.545246856,
-    0.6940070834,
-    0.7199681717,
-    0.06950936031,
-    0.9975812994,
-    0.1702942185,
-    -0.9853932612,
-    0.2695973274,
-    0.9629731466,
-    0.5519612192,
-    -0.8338697815,
-    0.225657487,
-    -0.9742067022,
-    0.4215262855,
-    -0.9068161835,
-    0.4881873305,
-    -0.8727388672,
-    -0.3683854996,
-    -0.9296731273,
-    -0.9825390578,
-    0.1860564427,
-    0.81256471,
-    0.5828709909,
-    0.3196460933,
-    -0.9475370046,
-    0.9570913859,
-    0.2897862643,
-    -0.6876655497,
-    -0.7260276109,
-    -0.9988770922,
-    -0.047376731,
-    -0.1250179027,
-    0.992154486,
-    -0.8280133617,
-    0.560708367,
-    0.9324863769,
-    -0.3612051451,
-    0.6394653183,
-    0.7688199442,
-    -0.01623847064,
-    -0.9998681473,
-    -0.9955014666,
-    -0.09474613458,
-    -0.81453315,
-    0.580117012,
-    0.4037327978,
-    -0.9148769469,
-    0.9944263371,
-    0.1054336766,
-    -0.1624711654,
-    0.9867132919,
-    -0.9949487814,
-    -0.100383875,
-    -0.6995302564,
-    0.7146029809,
-    0.5263414922,
-    -0.85027327,
-    -0.5395221479,
-    0.841971408,
-    0.6579370318,
-    0.7530729462,
-    0.01426758847,
-    -0.9998982128,
-    -0.6734383991,
-    0.7392433447,
-    0.639412098,
-    -0.7688642071,
-    0.9211571421,
-    0.3891908523,
-    -0.146637214,
-    -0.9891903394,
-    -0.782318098,
-    0.6228791163,
-    -0.5039610839,
-    -0.8637263605,
-    -0.7743120191,
-    -0.6328039957
-  ];
-  // prettier-ignore
-  _Gradients3D = [
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    1,
-    0,
-    1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    -1,
-    0,
-    1,
-    1,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    1,
-    -1,
-    0,
-    0,
-    -1,
-    -1,
-    0,
-    0,
-    1,
-    1,
-    0,
-    0,
-    0,
-    -1,
-    1,
-    0,
-    -1,
-    1,
-    0,
-    0,
-    0,
-    -1,
-    -1,
-    0
-  ];
-  // prettier-ignore
-  _RandVecs3D = [
-    -0.7292736885,
-    -0.6618439697,
-    0.1735581948,
-    0,
-    0.790292081,
-    -0.5480887466,
-    -0.2739291014,
-    0,
-    0.7217578935,
-    0.6226212466,
-    -0.3023380997,
-    0,
-    0.565683137,
-    -0.8208298145,
-    -0.0790000257,
-    0,
-    0.760049034,
-    -0.5555979497,
-    -0.3370999617,
-    0,
-    0.3713945616,
-    0.5011264475,
-    0.7816254623,
-    0,
-    -0.1277062463,
-    -0.4254438999,
-    -0.8959289049,
-    0,
-    -0.2881560924,
-    -0.5815838982,
-    0.7607405838,
-    0,
-    0.5849561111,
-    -0.662820239,
-    -0.4674352136,
-    0,
-    0.3307171178,
-    0.0391653737,
-    0.94291689,
-    0,
-    0.8712121778,
-    -0.4113374369,
-    -0.2679381538,
-    0,
-    0.580981015,
-    0.7021915846,
-    0.4115677815,
-    0,
-    0.503756873,
-    0.6330056931,
-    -0.5878203852,
-    0,
-    0.4493712205,
-    0.601390195,
-    0.6606022552,
-    0,
-    -0.6878403724,
-    0.09018890807,
-    -0.7202371714,
-    0,
-    -0.5958956522,
-    -0.6469350577,
-    0.475797649,
-    0,
-    -0.5127052122,
-    0.1946921978,
-    -0.8361987284,
-    0,
-    -0.9911507142,
-    -0.05410276466,
-    -0.1212153153,
-    0,
-    -0.2149721042,
-    0.9720882117,
-    -0.09397607749,
-    0,
-    -0.7518650936,
-    -0.5428057603,
-    0.3742469607,
-    0,
-    0.5237068895,
-    0.8516377189,
-    -0.02107817834,
-    0,
-    0.6333504779,
-    0.1926167129,
-    -0.7495104896,
-    0,
-    -0.06788241606,
-    0.3998305789,
-    0.9140719259,
-    0,
-    -0.5538628599,
-    -0.4729896695,
-    -0.6852128902,
-    0,
-    -0.7261455366,
-    -0.5911990757,
-    0.3509933228,
-    0,
-    -0.9229274737,
-    -0.1782808786,
-    0.3412049336,
-    0,
-    -0.6968815002,
-    0.6511274338,
-    0.3006480328,
-    0,
-    0.9608044783,
-    -0.2098363234,
-    -0.1811724921,
-    0,
-    0.06817146062,
-    -0.9743405129,
-    0.2145069156,
-    0,
-    -0.3577285196,
-    -0.6697087264,
-    -0.6507845481,
-    0,
-    -0.1868621131,
-    0.7648617052,
-    -0.6164974636,
-    0,
-    -0.6541697588,
-    0.3967914832,
-    0.6439087246,
-    0,
-    0.6993340405,
-    -0.6164538506,
-    0.3618239211,
-    0,
-    -0.1546665739,
-    0.6291283928,
-    0.7617583057,
-    0,
-    -0.6841612949,
-    -0.2580482182,
-    -0.6821542638,
-    0,
-    0.5383980957,
-    0.4258654885,
-    0.7271630328,
-    0,
-    -0.5026987823,
-    -0.7939832935,
-    -0.3418836993,
-    0,
-    0.3202971715,
-    0.2834415347,
-    0.9039195862,
-    0,
-    0.8683227101,
-    -3762656404e-13,
-    -0.4959995258,
-    0,
-    0.791120031,
-    -0.08511045745,
-    0.6057105799,
-    0,
-    -0.04011016052,
-    -0.4397248749,
-    0.8972364289,
-    0,
-    0.9145119872,
-    0.3579346169,
-    -0.1885487608,
-    0,
-    -0.9612039066,
-    -0.2756484276,
-    0.01024666929,
-    0,
-    0.6510361721,
-    -0.2877799159,
-    -0.7023778346,
-    0,
-    -0.2041786351,
-    0.7365237271,
-    0.644859585,
-    0,
-    -0.7718263711,
-    0.3790626912,
-    0.5104855816,
-    0,
-    -0.3060082741,
-    -0.7692987727,
-    0.5608371729,
-    0,
-    0.454007341,
-    -0.5024843065,
-    0.7357899537,
-    0,
-    0.4816795475,
-    0.6021208291,
-    -0.6367380315,
-    0,
-    0.6961980369,
-    -0.3222197429,
-    0.641469197,
-    0,
-    -0.6532160499,
-    -0.6781148932,
-    0.3368515753,
-    0,
-    0.5089301236,
-    -0.6154662304,
-    -0.6018234363,
-    0,
-    -0.1635919754,
-    -0.9133604627,
-    -0.372840892,
-    0,
-    0.52408019,
-    -0.8437664109,
-    0.1157505864,
-    0,
-    0.5902587356,
-    0.4983817807,
-    -0.6349883666,
-    0,
-    0.5863227872,
-    0.494764745,
-    0.6414307729,
-    0,
-    0.6779335087,
-    0.2341345225,
-    0.6968408593,
-    0,
-    0.7177054546,
-    -0.6858979348,
-    0.120178631,
-    0,
-    -0.5328819713,
-    -0.5205125012,
-    0.6671608058,
-    0,
-    -0.8654874251,
-    -0.0700727088,
-    -0.4960053754,
-    0,
-    -0.2861810166,
-    0.7952089234,
-    0.5345495242,
-    0,
-    -0.04849529634,
-    0.9810836427,
-    -0.1874115585,
-    0,
-    -0.6358521667,
-    0.6058348682,
-    0.4781800233,
-    0,
-    0.6254794696,
-    -0.2861619734,
-    0.7258696564,
-    0,
-    -0.2585259868,
-    0.5061949264,
-    -0.8227581726,
-    0,
-    0.02136306781,
-    0.5064016808,
-    -0.8620330371,
-    0,
-    0.200111773,
-    0.8599263484,
-    0.4695550591,
-    0,
-    0.4743561372,
-    0.6014985084,
-    -0.6427953014,
-    0,
-    0.6622993731,
-    -0.5202474575,
-    -0.5391679918,
-    0,
-    0.08084972818,
-    -0.6532720452,
-    0.7527940996,
-    0,
-    -0.6893687501,
-    0.0592860349,
-    0.7219805347,
-    0,
-    -0.1121887082,
-    -0.9673185067,
-    0.2273952515,
-    0,
-    0.7344116094,
-    0.5979668656,
-    -0.3210532909,
-    0,
-    0.5789393465,
-    -0.2488849713,
-    0.7764570201,
-    0,
-    0.6988182827,
-    0.3557169806,
-    -0.6205791146,
-    0,
-    -0.8636845529,
-    -0.2748771249,
-    -0.4224826141,
-    0,
-    -0.4247027957,
-    -0.4640880967,
-    0.777335046,
-    0,
-    0.5257722489,
-    -0.8427017621,
-    0.1158329937,
-    0,
-    0.9343830603,
-    0.316302472,
-    -0.1639543925,
-    0,
-    -0.1016836419,
-    -0.8057303073,
-    -0.5834887393,
-    0,
-    -0.6529238969,
-    0.50602126,
-    -0.5635892736,
-    0,
-    -0.2465286165,
-    -0.9668205684,
-    -0.06694497494,
-    0,
-    -0.9776897119,
-    -0.2099250524,
-    -0.007368825344,
-    0,
-    0.7736893337,
-    0.5734244712,
-    0.2694238123,
-    0,
-    -0.6095087895,
-    0.4995678998,
-    0.6155736747,
-    0,
-    0.5794535482,
-    0.7434546771,
-    0.3339292269,
-    0,
-    -0.8226211154,
-    0.08142581855,
-    0.5627293636,
-    0,
-    -0.510385483,
-    0.4703667658,
-    0.7199039967,
-    0,
-    -0.5764971849,
-    -0.07231656274,
-    -0.8138926898,
-    0,
-    0.7250628871,
-    0.3949971505,
-    -0.5641463116,
-    0,
-    -0.1525424005,
-    0.4860840828,
-    -0.8604958341,
-    0,
-    -0.5550976208,
-    -0.4957820792,
-    0.667882296,
-    0,
-    -0.1883614327,
-    0.9145869398,
-    0.357841725,
-    0,
-    0.7625556724,
-    -0.5414408243,
-    -0.3540489801,
-    0,
-    -0.5870231946,
-    -0.3226498013,
-    -0.7424963803,
-    0,
-    0.3051124198,
-    0.2262544068,
-    -0.9250488391,
-    0,
-    0.6379576059,
-    0.577242424,
-    -0.5097070502,
-    0,
-    -0.5966775796,
-    0.1454852398,
-    -0.7891830656,
-    0,
-    -0.658330573,
-    0.6555487542,
-    -0.3699414651,
-    0,
-    0.7434892426,
-    0.2351084581,
-    0.6260573129,
-    0,
-    0.5562114096,
-    0.8264360377,
-    -0.0873632843,
-    0,
-    -0.3028940016,
-    -0.8251527185,
-    0.4768419182,
-    0,
-    0.1129343818,
-    -0.985888439,
-    -0.1235710781,
-    0,
-    0.5937652891,
-    -0.5896813806,
-    0.5474656618,
-    0,
-    0.6757964092,
-    -0.5835758614,
-    -0.4502648413,
-    0,
-    0.7242302609,
-    -0.1152719764,
-    0.6798550586,
-    0,
-    -0.9511914166,
-    0.0753623979,
-    -0.2992580792,
-    0,
-    0.2539470961,
-    -0.1886339355,
-    0.9486454084,
-    0,
-    0.571433621,
-    -0.1679450851,
-    -0.8032795685,
-    0,
-    -0.06778234979,
-    0.3978269256,
-    0.9149531629,
-    0,
-    0.6074972649,
-    0.733060024,
-    -0.3058922593,
-    0,
-    -0.5435478392,
-    0.1675822484,
-    0.8224791405,
-    0,
-    -0.5876678086,
-    -0.3380045064,
-    -0.7351186982,
-    0,
-    -0.7967562402,
-    0.04097822706,
-    -0.6029098428,
-    0,
-    -0.1996350917,
-    0.8706294745,
-    0.4496111079,
-    0,
-    -0.02787660336,
-    -0.9106232682,
-    -0.4122962022,
-    0,
-    -0.7797625996,
-    -0.6257634692,
-    0.01975775581,
-    0,
-    -0.5211232846,
-    0.7401644346,
-    -0.4249554471,
-    0,
-    0.8575424857,
-    0.4053272873,
-    -0.3167501783,
-    0,
-    0.1045223322,
-    0.8390195772,
-    -0.5339674439,
-    0,
-    0.3501822831,
-    0.9242524096,
-    -0.1520850155,
-    0,
-    0.1987849858,
-    0.07647613266,
-    0.9770547224,
-    0,
-    0.7845996363,
-    0.6066256811,
-    -0.1280964233,
-    0,
-    0.09006737436,
-    -0.9750989929,
-    -0.2026569073,
-    0,
-    -0.8274343547,
-    -0.542299559,
-    0.1458203587,
-    0,
-    -0.3485797732,
-    -0.415802277,
-    0.840000362,
-    0,
-    -0.2471778936,
-    -0.7304819962,
-    -0.6366310879,
-    0,
-    -0.3700154943,
-    0.8577948156,
-    0.3567584454,
-    0,
-    0.5913394901,
-    -0.548311967,
-    -0.5913303597,
-    0,
-    0.1204873514,
-    -0.7626472379,
-    -0.6354935001,
-    0,
-    0.616959265,
-    0.03079647928,
-    0.7863922953,
-    0,
-    0.1258156836,
-    -0.6640829889,
-    -0.7369967419,
-    0,
-    -0.6477565124,
-    -0.1740147258,
-    -0.7417077429,
-    0,
-    0.6217889313,
-    -0.7804430448,
-    -0.06547655076,
-    0,
-    0.6589943422,
-    -0.6096987708,
-    0.4404473475,
-    0,
-    -0.2689837504,
-    -0.6732403169,
-    -0.6887635427,
-    0,
-    -0.3849775103,
-    0.5676542638,
-    0.7277093879,
-    0,
-    0.5754444408,
-    0.8110471154,
-    -0.1051963504,
-    0,
-    0.9141593684,
-    0.3832947817,
-    0.131900567,
-    0,
-    -0.107925319,
-    0.9245493968,
-    0.3654593525,
-    0,
-    0.377977089,
-    0.3043148782,
-    0.8743716458,
-    0,
-    -0.2142885215,
-    -0.8259286236,
-    0.5214617324,
-    0,
-    0.5802544474,
-    0.4148098596,
-    -0.7008834116,
-    0,
-    -0.1982660881,
-    0.8567161266,
-    -0.4761596756,
-    0,
-    -0.03381553704,
-    0.3773180787,
-    -0.9254661404,
-    0,
-    -0.6867922841,
-    -0.6656597827,
-    0.2919133642,
-    0,
-    0.7731742607,
-    -0.2875793547,
-    -0.5652430251,
-    0,
-    -0.09655941928,
-    0.9193708367,
-    -0.3813575004,
-    0,
-    0.2715702457,
-    -0.9577909544,
-    -0.09426605581,
-    0,
-    0.2451015704,
-    -0.6917998565,
-    -0.6792188003,
-    0,
-    0.977700782,
-    -0.1753855374,
-    0.1155036542,
-    0,
-    -0.5224739938,
-    0.8521606816,
-    0.02903615945,
-    0,
-    -0.7734880599,
-    -0.5261292347,
-    0.3534179531,
-    0,
-    -0.7134492443,
-    -0.269547243,
-    0.6467878011,
-    0,
-    0.1644037271,
-    0.5105846203,
-    -0.8439637196,
-    0,
-    0.6494635788,
-    0.05585611296,
-    0.7583384168,
-    0,
-    -0.4711970882,
-    0.5017280509,
-    -0.7254255765,
-    0,
-    -0.6335764307,
-    -0.2381686273,
-    -0.7361091029,
-    0,
-    -0.9021533097,
-    -0.270947803,
-    -0.3357181763,
-    0,
-    -0.3793711033,
-    0.872258117,
-    0.3086152025,
-    0,
-    -0.6855598966,
-    -0.3250143309,
-    0.6514394162,
-    0,
-    0.2900942212,
-    -0.7799057743,
-    -0.5546100667,
-    0,
-    -0.2098319339,
-    0.85037073,
-    0.4825351604,
-    0,
-    -0.4592603758,
-    0.6598504336,
-    -0.5947077538,
-    0,
-    0.8715945488,
-    0.09616365406,
-    -0.4807031248,
-    0,
-    -0.6776666319,
-    0.7118504878,
-    -0.1844907016,
-    0,
-    0.7044377633,
-    0.312427597,
-    0.637304036,
-    0,
-    -0.7052318886,
-    -0.2401093292,
-    -0.6670798253,
-    0,
-    0.081921007,
-    -0.7207336136,
-    -0.6883545647,
-    0,
-    -0.6993680906,
-    -0.5875763221,
-    -0.4069869034,
-    0,
-    -0.1281454481,
-    0.6419895885,
-    0.7559286424,
-    0,
-    -0.6337388239,
-    -0.6785471501,
-    -0.3714146849,
-    0,
-    0.5565051903,
-    -0.2168887573,
-    -0.8020356851,
-    0,
-    -0.5791554484,
-    0.7244372011,
-    -0.3738578718,
-    0,
-    0.1175779076,
-    -0.7096451073,
-    0.6946792478,
-    0,
-    -0.6134619607,
-    0.1323631078,
-    0.7785527795,
-    0,
-    0.6984635305,
-    -0.02980516237,
-    -0.715024719,
-    0,
-    0.8318082963,
-    -0.3930171956,
-    0.3919597455,
-    0,
-    0.1469576422,
-    0.05541651717,
-    -0.9875892167,
-    0,
-    0.708868575,
-    -0.2690503865,
-    0.6520101478,
-    0,
-    0.2726053183,
-    0.67369766,
-    -0.68688995,
-    0,
-    -0.6591295371,
-    0.3035458599,
-    -0.6880466294,
-    0,
-    0.4815131379,
-    -0.7528270071,
-    0.4487723203,
-    0,
-    0.9430009463,
-    0.1675647412,
-    -0.2875261255,
-    0,
-    0.434802957,
-    0.7695304522,
-    -0.4677277752,
-    0,
-    0.3931996188,
-    0.594473625,
-    0.7014236729,
-    0,
-    0.7254336655,
-    -0.603925654,
-    0.3301814672,
-    0,
-    0.7590235227,
-    -0.6506083235,
-    0.02433313207,
-    0,
-    -0.8552768592,
-    -0.3430042733,
-    0.3883935666,
-    0,
-    -0.6139746835,
-    0.6981725247,
-    0.3682257648,
-    0,
-    -0.7465905486,
-    -0.5752009504,
-    0.3342849376,
-    0,
-    0.5730065677,
-    0.810555537,
-    -0.1210916791,
-    0,
-    -0.9225877367,
-    -0.3475211012,
-    -0.167514036,
-    0,
-    -0.7105816789,
-    -0.4719692027,
-    -0.5218416899,
-    0,
-    -0.08564609717,
-    0.3583001386,
-    0.929669703,
-    0,
-    -0.8279697606,
-    -0.2043157126,
-    0.5222271202,
-    0,
-    0.427944023,
-    0.278165994,
-    0.8599346446,
-    0,
-    0.5399079671,
-    -0.7857120652,
-    -0.3019204161,
-    0,
-    0.5678404253,
-    -0.5495413974,
-    -0.6128307303,
-    0,
-    -0.9896071041,
-    0.1365639107,
-    -0.04503418428,
-    0,
-    -0.6154342638,
-    -0.6440875597,
-    0.4543037336,
-    0,
-    0.1074204368,
-    -0.7946340692,
-    0.5975094525,
-    0,
-    -0.3595449969,
-    -0.8885529948,
-    0.28495784,
-    0,
-    -0.2180405296,
-    0.1529888965,
-    0.9638738118,
-    0,
-    -0.7277432317,
-    -0.6164050508,
-    -0.3007234646,
-    0,
-    0.7249729114,
-    -0.00669719484,
-    0.6887448187,
-    0,
-    -0.5553659455,
-    -0.5336586252,
-    0.6377908264,
-    0,
-    0.5137558015,
-    0.7976208196,
-    -0.3160000073,
-    0,
-    -0.3794024848,
-    0.9245608561,
-    -0.03522751494,
-    0,
-    0.8229248658,
-    0.2745365933,
-    -0.4974176556,
-    0,
-    -0.5404114394,
-    0.6091141441,
-    0.5804613989,
-    0,
-    0.8036581901,
-    -0.2703029469,
-    0.5301601931,
-    0,
-    0.6044318879,
-    0.6832968393,
-    0.4095943388,
-    0,
-    0.06389988817,
-    0.9658208605,
-    -0.2512108074,
-    0,
-    0.1087113286,
-    0.7402471173,
-    -0.6634877936,
-    0,
-    -0.713427712,
-    -0.6926784018,
-    0.1059128479,
-    0,
-    0.6458897819,
-    -0.5724548511,
-    -0.5050958653,
-    0,
-    -0.6553931414,
-    0.7381471625,
-    0.159995615,
-    0,
-    0.3910961323,
-    0.9188871375,
-    -0.05186755998,
-    0,
-    -0.4879022471,
-    -0.5904376907,
-    0.6429111375,
-    0,
-    0.6014790094,
-    0.7707441366,
-    -0.2101820095,
-    0,
-    -0.5677173047,
-    0.7511360995,
-    0.3368851762,
-    0,
-    0.7858573506,
-    0.226674665,
-    0.5753666838,
-    0,
-    -0.4520345543,
-    -0.604222686,
-    -0.6561857263,
-    0,
-    0.002272116345,
-    0.4132844051,
-    -0.9105991643,
-    0,
-    -0.5815751419,
-    -0.5162925989,
-    0.6286591339,
-    0,
-    -0.03703704785,
-    0.8273785755,
-    0.5604221175,
-    0,
-    -0.5119692504,
-    0.7953543429,
-    -0.3244980058,
-    0,
-    -0.2682417366,
-    -0.9572290247,
-    -0.1084387619,
-    0,
-    -0.2322482736,
-    -0.9679131102,
-    -0.09594243324,
-    0,
-    0.3554328906,
-    -0.8881505545,
-    0.2913006227,
-    0,
-    0.7346520519,
-    -0.4371373164,
-    0.5188422971,
-    0,
-    0.9985120116,
-    0.04659011161,
-    -0.02833944577,
-    0,
-    -0.3727687496,
-    -0.9082481361,
-    0.1900757285,
-    0,
-    0.91737377,
-    -0.3483642108,
-    0.1925298489,
-    0,
-    0.2714911074,
-    0.4147529736,
-    -0.8684886582,
-    0,
-    0.5131763485,
-    -0.7116334161,
-    0.4798207128,
-    0,
-    -0.8737353606,
-    0.18886992,
-    -0.4482350644,
-    0,
-    0.8460043821,
-    -0.3725217914,
-    0.3814499973,
-    0,
-    0.8978727456,
-    -0.1780209141,
-    -0.4026575304,
-    0,
-    0.2178065647,
-    -0.9698322841,
-    -0.1094789531,
-    0,
-    -0.1518031304,
-    -0.7788918132,
-    -0.6085091231,
-    0,
-    -0.2600384876,
-    -0.4755398075,
-    -0.8403819825,
-    0,
-    0.572313509,
-    -0.7474340931,
-    -0.3373418503,
-    0,
-    -0.7174141009,
-    0.1699017182,
-    -0.6756111411,
-    0,
-    -0.684180784,
-    0.02145707593,
-    -0.7289967412,
-    0,
-    -0.2007447902,
-    0.06555605789,
-    -0.9774476623,
-    0,
-    -0.1148803697,
-    -0.8044887315,
-    0.5827524187,
-    0,
-    -0.7870349638,
-    0.03447489231,
-    0.6159443543,
-    0,
-    -0.2015596421,
-    0.6859872284,
-    0.6991389226,
-    0,
-    -0.08581082512,
-    -0.10920836,
-    -0.9903080513,
-    0,
-    0.5532693395,
-    0.7325250401,
-    -0.396610771,
-    0,
-    -0.1842489331,
-    -0.9777375055,
-    -0.1004076743,
-    0,
-    0.0775473789,
-    -0.9111505856,
-    0.4047110257,
-    0,
-    0.1399838409,
-    0.7601631212,
-    -0.6344734459,
-    0,
-    0.4484419361,
-    -0.845289248,
-    0.2904925424,
-    0
-  ];
-  _PrimeX = 501125321;
-  _PrimeY = 1136930381;
-  _PrimeZ = 1720413743;
-  /**
-   * @private
-   * @param {number} a
-   * @param {number} b
-   * @param {number} t
-   * @returns {number}
-   */
-  static _Lerp(a, b, t) {
-    return a + t * (b - a);
-  }
-  /**
-   * @private
-   * @param {number} t
-   * @returns {number}
-   */
-  static _InterpHermite(t) {
-    return t * t * (3 - 2 * t);
-  }
-  /**
-   * @private
-   * @param t
-   * @returns {number}
-   */
-  static _InterpQuintic(t) {
-    return t * t * t * (t * (t * 6 - 15) + 10);
-  }
-  /**
-   * @private
-   * @param {number} a
-   * @param {number} b
-   * @param {number} c
-   * @param {number} d
-   * @param {number} t
-   * @returns {number}
-   */
-  static _CubicLerp(a, b, c, d, t) {
-    let p = d - c - (a - b);
-    return t * t * t * p + t * t * (a - b - p) + t * (c - a) + b;
-  }
-  /**
-   * @private
-   * @param {number} t
-   * @returns {number}
-   */
-  static _PingPong(t) {
-    t -= Math.trunc(t * 0.5) * 2;
-    return t < 1 ? t : 2 - t;
-  }
-  /**
-   * @private
-   */
-  _CalculateFractalBounding() {
-    let gain = Math.abs(this._Gain);
-    let amp = gain;
-    let ampFractal = 1;
-    for (let i = 1; i < this._Octaves; i++) {
-      ampFractal += amp;
-      amp *= gain;
-    }
-    this._FractalBounding = 1 / ampFractal;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} xPrimed
-   * @param {number} yPrimed
-   * @returns {number}
-   */
-  _HashR2(seed2, xPrimed, yPrimed) {
-    let hash = seed2 ^ xPrimed ^ yPrimed;
-    hash = Math.imul(hash, 668265261);
-    return hash;
-  }
-  /**
-   *
-   * @param {number} seed
-   * @param {number} xPrimed
-   * @param {number} yPrimed
-   * @param {number} zPrimed
-   * @returns {number}
-   */
-  _HashR3(seed2, xPrimed, yPrimed, zPrimed) {
-    let hash = seed2 ^ xPrimed ^ yPrimed ^ zPrimed;
-    hash = Math.imul(hash, 668265261);
-    return hash;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} xPrimed
-   * @param {number} yPrimed
-   * @returns {number}
-   */
-  _ValCoordR2(seed2, xPrimed, yPrimed) {
-    let hash = this._HashR2(seed2, xPrimed, yPrimed);
-    hash = Math.imul(hash, hash);
-    hash ^= hash << 19;
-    return hash * (1 / 2147483648);
-  }
-  /**
-   *
-   * @param {number} seed
-   * @param {number} xPrimed
-   * @param {number} yPrimed
-   * @param {number} zPrimed
-   * @returns {number}
-   */
-  _ValCoordR3(seed2, xPrimed, yPrimed, zPrimed) {
-    let hash = this._HashR3(seed2, xPrimed, yPrimed, zPrimed);
-    hash = Math.imul(hash, hash);
-    hash ^= hash << 19;
-    return hash * (1 / 2147483648);
-  }
-  /**
-   *
-   * @param {number} seed
-   * @param {number} xPrimed
-   * @param {number} yPrimed
-   * @param {number} xd
-   * @param {number} yd
-   * @returns {number}
-   */
-  _GradCoordR2(seed2, xPrimed, yPrimed, xd, yd) {
-    let hash = this._HashR2(seed2, xPrimed, yPrimed);
-    hash ^= hash >> 15;
-    hash &= 127 << 1;
-    let xg = this._Gradients2D[hash];
-    let yg = this._Gradients2D[hash | 1];
-    return xd * xg + yd * yg;
-  }
-  /**
-   *
-   * @param {number} seed
-   * @param {number} xPrimed
-   * @param {number} yPrimed
-   * @param {number} zPrimed
-   * @param {number} xd
-   * @param {number} yd
-   * @param {number} zd
-   * @returns {number}
-   */
-  _GradCoordR3(seed2, xPrimed, yPrimed, zPrimed, xd, yd, zd) {
-    let hash = this._HashR3(seed2, xPrimed, yPrimed, zPrimed);
-    hash ^= hash >> 15;
-    hash &= 63 << 2;
-    let xg = this._Gradients3D[hash];
-    let yg = this._Gradients3D[hash | 1];
-    let zg = this._Gradients3D[hash | 2];
-    return xd * xg + yd * yg + zd * zg;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _GenNoiseSingleR2(seed2, x, y) {
-    switch (this._NoiseType) {
-      case _FastNoiseLite.NoiseType.OpenSimplex2:
-        return this._SingleOpenSimplex2R2(seed2, x, y);
-      case _FastNoiseLite.NoiseType.OpenSimplex2S:
-        return this._SingleOpenSimplex2SR2(seed2, x, y);
-      case _FastNoiseLite.NoiseType.Cellular:
-        return this._SingleCellularR2(seed2, x, y);
-      case _FastNoiseLite.NoiseType.Perlin:
-        return this._SinglePerlinR2(seed2, x, y);
-      case _FastNoiseLite.NoiseType.ValueCubic:
-        return this._SingleValueCubicR2(seed2, x, y);
-      case _FastNoiseLite.NoiseType.Value:
-        return this._SingleValueR2(seed2, x, y);
-      default:
-        return 0;
-    }
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _GenNoiseSingleR3(seed2, x, y, z) {
-    switch (this._NoiseType) {
-      case _FastNoiseLite.NoiseType.OpenSimplex2:
-        return this._SingleOpenSimplex2R3(seed2, x, y, z);
-      case _FastNoiseLite.NoiseType.OpenSimplex2S:
-        return this._SingleOpenSimplex2SR3(seed2, x, y, z);
-      case _FastNoiseLite.NoiseType.Cellular:
-        return this._SingleCellularR3(seed2, x, y, z);
-      case _FastNoiseLite.NoiseType.Perlin:
-        return this._SinglePerlinR3(seed2, x, y, z);
-      case _FastNoiseLite.NoiseType.ValueCubic:
-        return this._SingleValueCubicR3(seed2, x, y, z);
-      case _FastNoiseLite.NoiseType.Value:
-        return this._SingleValueR3(seed2, x, y, z);
-      default:
-        return 0;
-    }
-  }
-  /**
-   * @private
-   */
-  _UpdateTransformType3D() {
-    switch (this._RotationType3D) {
-      case _FastNoiseLite.RotationType3D.ImproveXYPlanes:
-        this._TransformType3D = _FastNoiseLite.TransformType3D.ImproveXYPlanes;
-        break;
-      case _FastNoiseLite.RotationType3D.ImproveXZPlanes:
-        this._TransformType3D = _FastNoiseLite.TransformType3D.ImproveXZPlanes;
-        break;
-      default:
-        switch (this._NoiseType) {
-          case _FastNoiseLite.NoiseType.OpenSimplex2:
-          case _FastNoiseLite.NoiseType.OpenSimplex2S:
-            this._TransformType3D = _FastNoiseLite.TransformType3D.DefaultOpenSimplex2;
-            break;
-          default:
-            this._TransformType3D = _FastNoiseLite.TransformType3D.None;
-            break;
-        }
-        break;
-    }
-  }
-  /**
-   * @private
-   */
-  _UpdateWarpTransformType3D() {
-    switch (this._RotationType3D) {
-      case _FastNoiseLite.RotationType3D.ImproveXYPlanes:
-        this._WarpTransformType3D = _FastNoiseLite.TransformType3D.ImproveXYPlanes;
-        break;
-      case _FastNoiseLite.RotationType3D.ImproveXZPlanes:
-        this._WarpTransformType3D = _FastNoiseLite.TransformType3D.ImproveXZPlanes;
-        break;
-      default:
-        switch (this._DomainWarpType) {
-          case _FastNoiseLite.DomainWarpType.OpenSimplex2:
-          case _FastNoiseLite.DomainWarpType.OpenSimplex2Reduced:
-            this._WarpTransformType3D = _FastNoiseLite.TransformType3D.DefaultOpenSimplex2;
-            break;
-          default:
-            this._WarpTransformType3D = _FastNoiseLite.TransformType3D.None;
-            break;
-        }
-        break;
-    }
-  }
-  /**
-   * @private
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _GenFractalFBmR2(x, y) {
-    let seed2 = this._Seed;
-    let sum = 0;
-    let amp = this._FractalBounding;
-    for (let i = 0; i < this._Octaves; i++) {
-      let noise = this._GenNoiseSingleR2(seed2++, x, y);
-      sum += noise * amp;
-      amp *= _FastNoiseLite._Lerp(1, Math.min(noise + 1, 2) * 0.5, this._WeightedStrength);
-      x *= this._Lacunarity;
-      y *= this._Lacunarity;
-      amp *= this._Gain;
-    }
-    return sum;
-  }
-  /**
-   * @private
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _GenFractalFBmR3(x, y, z) {
-    let seed2 = this._Seed;
-    let sum = 0;
-    let amp = this._FractalBounding;
-    for (let i = 0; i < this._Octaves; i++) {
-      let noise = this._GenNoiseSingleR3(seed2++, x, y, z);
-      sum += noise * amp;
-      amp *= _FastNoiseLite._Lerp(1, (noise + 1) * 0.5, this._WeightedStrength);
-      x *= this._Lacunarity;
-      y *= this._Lacunarity;
-      z *= this._Lacunarity;
-      amp *= this._Gain;
-    }
-    return sum;
-  }
-  /**
-   * @private
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _GenFractalRidgedR2(x, y) {
-    let seed2 = this._Seed;
-    let sum = 0;
-    let amp = this._FractalBounding;
-    for (let i = 0; i < this._Octaves; i++) {
-      let noise = Math.abs(this._GenNoiseSingleR2(seed2++, x, y));
-      sum += (noise * -2 + 1) * amp;
-      amp *= _FastNoiseLite._Lerp(1, 1 - noise, this._WeightedStrength);
-      x *= this._Lacunarity;
-      y *= this._Lacunarity;
-      amp *= this._Gain;
-    }
-    return sum;
-  }
-  /**
-   * @private
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _GenFractalRidgedR3(x, y, z) {
-    let seed2 = this._Seed;
-    let sum = 0;
-    let amp = this._FractalBounding;
-    for (let i = 0; i < this._Octaves; i++) {
-      let noise = Math.abs(this._GenNoiseSingleR3(seed2++, x, y, z));
-      sum += (noise * -2 + 1) * amp;
-      amp *= _FastNoiseLite._Lerp(1, 1 - noise, this._WeightedStrength);
-      x *= this._Lacunarity;
-      y *= this._Lacunarity;
-      z *= this._Lacunarity;
-      amp *= this._Gain;
-    }
-    return sum;
-  }
-  /**
-   * @private
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _GenFractalPingPongR2(x, y) {
-    let seed2 = this._Seed;
-    let sum = 0;
-    let amp = this._FractalBounding;
-    for (let i = 0; i < this._Octaves; i++) {
-      let noise = _FastNoiseLite._PingPong(
-        (this._GenNoiseSingleR2(seed2++, x, y) + 1) * this._PingPongStrength
-      );
-      sum += (noise - 0.5) * 2 * amp;
-      amp *= _FastNoiseLite._Lerp(1, noise, this._WeightedStrength);
-      x *= this._Lacunarity;
-      y *= this._Lacunarity;
-      amp *= this._Gain;
-    }
-    return sum;
-  }
-  /**
-   * @private
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _GenFractalPingPongR3(x, y, z) {
-    let seed2 = this._Seed;
-    let sum = 0;
-    let amp = this._FractalBounding;
-    for (let i = 0; i < this._Octaves; i++) {
-      let noise = _FastNoiseLite._PingPong(
-        (this._GenNoiseSingleR3(seed2++, x, y, z) + 1) * this._PingPongStrength
-      );
-      sum += (noise - 0.5) * 2 * amp;
-      amp *= _FastNoiseLite._Lerp(1, noise, this._WeightedStrength);
-      x *= this._Lacunarity;
-      y *= this._Lacunarity;
-      z *= this._Lacunarity;
-      amp *= this._Gain;
-    }
-    return sum;
-  }
-  /**
-   *
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _SingleOpenSimplex2R2(seed2, x, y) {
-    const SQRT3 = 1.7320508075688772;
-    const G2 = (3 - SQRT3) / 6;
-    let i = Math.floor(x);
-    let j = Math.floor(y);
-    let xi = x - i;
-    let yi = y - j;
-    let t = (xi + yi) * G2;
-    let x0 = xi - t;
-    let y0 = yi - t;
-    i = Math.imul(i, this._PrimeX);
-    j = Math.imul(j, this._PrimeY);
-    let n0, n1, n2;
-    let a = 0.5 - x0 * x0 - y0 * y0;
-    if (a <= 0) {
-      n0 = 0;
-    } else {
-      n0 = a * a * (a * a) * this._GradCoordR2(seed2, i, j, x0, y0);
-    }
-    let c = 2 * (1 - 2 * G2) * (1 / G2 - 2) * t + (-2 * (1 - 2 * G2) * (1 - 2 * G2) + a);
-    if (c <= 0) {
-      n2 = 0;
-    } else {
-      let x2 = x0 + (2 * G2 - 1);
-      let y2 = y0 + (2 * G2 - 1);
-      n2 = c * c * (c * c) * this._GradCoordR2(seed2, i + this._PrimeX, j + this._PrimeY, x2, y2);
-    }
-    if (y0 > x0) {
-      let x1 = x0 + G2;
-      let y1 = y0 + (G2 - 1);
-      let b = 0.5 - x1 * x1 - y1 * y1;
-      if (b <= 0) {
-        n1 = 0;
-      } else {
-        n1 = b * b * (b * b) * this._GradCoordR2(seed2, i, j + this._PrimeY, x1, y1);
-      }
-    } else {
-      let x1 = x0 + (G2 - 1);
-      let y1 = y0 + G2;
-      let b = 0.5 - x1 * x1 - y1 * y1;
-      if (b <= 0) {
-        n1 = 0;
-      } else {
-        n1 = b * b * (b * b) * this._GradCoordR2(seed2, i + this._PrimeX, j, x1, y1);
-      }
-    }
-    return (n0 + n1 + n2) * 99.83685446303647;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _SingleOpenSimplex2R3(seed2, x, y, z) {
-    let i = Math.round(x);
-    let j = Math.round(y);
-    let k = Math.round(z);
-    let x0 = x - i;
-    let y0 = y - j;
-    let z0 = z - k;
-    let yNSign = Math.trunc(-1 - y0 | 1);
-    let xNSign = Math.trunc(-1 - x0 | 1);
-    let zNSign = Math.trunc(-1 - z0 | 1);
-    let ax0 = xNSign * -x0;
-    let ay0 = yNSign * -y0;
-    let az0 = zNSign * -z0;
-    i = Math.imul(i, this._PrimeX);
-    j = Math.imul(j, this._PrimeY);
-    k = Math.imul(k, this._PrimeZ);
-    let value = 0;
-    let a = 0.6 - x0 * x0 - (y0 * y0 + z0 * z0);
-    for (let l = 0; ; l++) {
-      if (a > 0) {
-        value += a * a * (a * a) * this._GradCoordR3(seed2, i, j, k, x0, y0, z0);
-      }
-      if (ax0 >= ay0 && ax0 >= az0) {
-        let b = a + ax0 + ax0;
-        if (b > 1) {
-          b -= 1;
-          value += b * b * (b * b) * this._GradCoordR3(
-            seed2,
-            i - xNSign * this._PrimeX,
-            j,
-            k,
-            x0 + xNSign,
-            y0,
-            z0
-          );
-        }
-      } else if (ay0 > ax0 && ay0 >= az0) {
-        let b = a + ay0 + ay0;
-        if (b > 1) {
-          b -= 1;
-          value += b * b * (b * b) * this._GradCoordR3(
-            seed2,
-            i,
-            j - yNSign * this._PrimeY,
-            k,
-            x0,
-            y0 + yNSign,
-            z0
-          );
-        }
-      } else {
-        let b = a + az0 + az0;
-        if (b > 1) {
-          b -= 1;
-          value += b * b * (b * b) * this._GradCoordR3(
-            seed2,
-            i,
-            j,
-            k - zNSign * this._PrimeZ,
-            x0,
-            y0,
-            z0 + zNSign
-          );
-        }
-      }
-      if (l === 1) {
-        break;
-      }
-      ax0 = 0.5 - ax0;
-      ay0 = 0.5 - ay0;
-      az0 = 0.5 - az0;
-      x0 = xNSign * ax0;
-      y0 = yNSign * ay0;
-      z0 = zNSign * az0;
-      a += 0.75 - ax0 - (ay0 + az0);
-      i += xNSign >> 1 & this._PrimeX;
-      j += yNSign >> 1 & this._PrimeY;
-      k += zNSign >> 1 & this._PrimeZ;
-      xNSign = -xNSign;
-      yNSign = -yNSign;
-      zNSign = -zNSign;
-      seed2 = ~seed2;
-    }
-    return value * 32.69428253173828;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _SingleOpenSimplex2SR2(seed2, x, y) {
-    const SQRT3 = 1.7320508075688772;
-    const G2 = (3 - SQRT3) / 6;
-    let i = Math.floor(x);
-    let j = Math.floor(y);
-    let xi = x - i;
-    let yi = y - j;
-    i = Math.imul(i, this._PrimeX);
-    j = Math.imul(j, this._PrimeY);
-    let i1 = i + this._PrimeX;
-    let j1 = j + this._PrimeY;
-    let t = (xi + yi) * G2;
-    let x0 = xi - t;
-    let y0 = yi - t;
-    let a0 = 2 / 3 - x0 * x0 - y0 * y0;
-    let value = a0 * a0 * (a0 * a0) * this._GradCoordR2(seed2, i, j, x0, y0);
-    let a1 = 2 * (1 - 2 * G2) * (1 / G2 - 2) * t + (-2 * (1 - 2 * G2) * (1 - 2 * G2) + a0);
-    let x1 = x0 - (1 - 2 * G2);
-    let y1 = y0 - (1 - 2 * G2);
-    value += a1 * a1 * (a1 * a1) * this._GradCoordR2(seed2, i1, j1, x1, y1);
-    let xmyi = xi - yi;
-    if (t > G2) {
-      if (xi + xmyi > 1) {
-        let x2 = x0 + (3 * G2 - 2);
-        let y2 = y0 + (3 * G2 - 1);
-        let a2 = 2 / 3 - x2 * x2 - y2 * y2;
-        if (a2 > 0) {
-          value += a2 * a2 * (a2 * a2) * this._GradCoordR2(seed2, i + (this._PrimeX << 1), j + this._PrimeY, x2, y2);
-        }
-      } else {
-        let x2 = x0 + G2;
-        let y2 = y0 + (G2 - 1);
-        let a2 = 2 / 3 - x2 * x2 - y2 * y2;
-        if (a2 > 0) {
-          value += a2 * a2 * (a2 * a2) * this._GradCoordR2(seed2, i, j + this._PrimeY, x2, y2);
-        }
-      }
-      if (yi - xmyi > 1) {
-        let x3 = x0 + (3 * G2 - 1);
-        let y3 = y0 + (3 * G2 - 2);
-        let a3 = 2 / 3 - x3 * x3 - y3 * y3;
-        if (a3 > 0) {
-          value += a3 * a3 * (a3 * a3) * this._GradCoordR2(seed2, i + this._PrimeX, j + (this._PrimeY << 1), x3, y3);
-        }
-      } else {
-        let x3 = x0 + (G2 - 1);
-        let y3 = y0 + G2;
-        let a3 = 2 / 3 - x3 * x3 - y3 * y3;
-        if (a3 > 0) {
-          value += a3 * a3 * (a3 * a3) * this._GradCoordR2(seed2, i + this._PrimeX, j, x3, y3);
-        }
-      }
-    } else {
-      if (xi + xmyi < 0) {
-        let x2 = x0 + (1 - G2);
-        let y2 = y0 - G2;
-        let a2 = 2 / 3 - x2 * x2 - y2 * y2;
-        if (a2 > 0) {
-          value += a2 * a2 * (a2 * a2) * this._GradCoordR2(seed2, i - this._PrimeX, j, x2, y2);
-        }
-      } else {
-        let x2 = x0 + (G2 - 1);
-        let y2 = y0 + G2;
-        let a2 = 2 / 3 - x2 * x2 - y2 * y2;
-        if (a2 > 0) {
-          value += a2 * a2 * (a2 * a2) * this._GradCoordR2(seed2, i + this._PrimeX, j, x2, y2);
-        }
-      }
-      if (yi < xmyi) {
-        let x2 = x0 - G2;
-        let y2 = y0 - (G2 - 1);
-        let a2 = 2 / 3 - x2 * x2 - y2 * y2;
-        if (a2 > 0) {
-          value += a2 * a2 * (a2 * a2) * this._GradCoordR2(seed2, i, j - this._PrimeY, x2, y2);
-        }
-      } else {
-        let x2 = x0 + G2;
-        let y2 = y0 + (G2 - 1);
-        let a2 = 2 / 3 - x2 * x2 - y2 * y2;
-        if (a2 > 0) {
-          value += a2 * a2 * (a2 * a2) * this._GradCoordR2(seed2, i, j + this._PrimeY, x2, y2);
-        }
-      }
-    }
-    return value * 18.24196194486065;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _SingleOpenSimplex2SR3(seed2, x, y, z) {
-    let i = Math.floor(x);
-    let j = Math.floor(y);
-    let k = Math.floor(z);
-    let xi = x - i;
-    let yi = y - j;
-    let zi = z - k;
-    i = Math.imul(i, this._PrimeX);
-    j = Math.imul(j, this._PrimeY);
-    k = Math.imul(k, this._PrimeZ);
-    let seed22 = seed2 + 1293373;
-    let xNMask = Math.trunc(-0.5 - xi);
-    let yNMask = Math.trunc(-0.5 - yi);
-    let zNMask = Math.trunc(-0.5 - zi);
-    let x0 = xi + xNMask;
-    let y0 = yi + yNMask;
-    let z0 = zi + zNMask;
-    let a0 = 0.75 - x0 * x0 - y0 * y0 - z0 * z0;
-    let value = a0 * a0 * (a0 * a0) * this._GradCoordR3(
-      seed2,
-      i + (xNMask & this._PrimeX),
-      j + (yNMask & this._PrimeY),
-      k + (zNMask & this._PrimeZ),
-      x0,
-      y0,
-      z0
-    );
-    let x1 = xi - 0.5;
-    let y1 = yi - 0.5;
-    let z1 = zi - 0.5;
-    let a1 = 0.75 - x1 * x1 - y1 * y1 - z1 * z1;
-    value += a1 * a1 * (a1 * a1) * this._GradCoordR3(seed22, i + this._PrimeX, j + this._PrimeY, k + this._PrimeZ, x1, y1, z1);
-    let xAFlipMask0 = ((xNMask | 1) << 1) * x1;
-    let yAFlipMask0 = ((yNMask | 1) << 1) * y1;
-    let zAFlipMask0 = ((zNMask | 1) << 1) * z1;
-    let xAFlipMask1 = (-2 - (xNMask << 2)) * x1 - 1;
-    let yAFlipMask1 = (-2 - (yNMask << 2)) * y1 - 1;
-    let zAFlipMask1 = (-2 - (zNMask << 2)) * z1 - 1;
-    let skip5 = false;
-    let a2 = xAFlipMask0 + a0;
-    if (a2 > 0) {
-      let x2 = x0 - (xNMask | 1);
-      value += a2 * a2 * (a2 * a2) * this._GradCoordR3(
-        seed2,
-        i + (~xNMask & this._PrimeX),
-        j + (yNMask & this._PrimeY),
-        k + (zNMask & this._PrimeZ),
-        x2,
-        y0,
-        z0
-      );
-    } else {
-      let a3 = yAFlipMask0 + zAFlipMask0 + a0;
-      if (a3 > 0) {
-        let x3 = x0;
-        let y3 = y0 - (yNMask | 1);
-        let z3 = z0 - (zNMask | 1);
-        value += a3 * a3 * (a3 * a3) * this._GradCoordR3(
-          seed2,
-          i + (xNMask & this._PrimeX),
-          j + (~yNMask & this._PrimeY),
-          k + (~zNMask & this._PrimeZ),
-          x3,
-          y3,
-          z3
-        );
-      }
-      let a4 = xAFlipMask1 + a1;
-      if (a4 > 0) {
-        let x4 = (xNMask | 1) + x1;
-        value += a4 * a4 * (a4 * a4) * this._GradCoordR3(
-          seed22,
-          i + (xNMask & this._PrimeX * 2),
-          j + this._PrimeY,
-          k + this._PrimeZ,
-          x4,
-          y1,
-          z1
-        );
-        skip5 = true;
-      }
-    }
-    let skip9 = false;
-    let a6 = yAFlipMask0 + a0;
-    if (a6 > 0) {
-      let x6 = x0;
-      let y6 = y0 - (yNMask | 1);
-      value += a6 * a6 * (a6 * a6) * this._GradCoordR3(
-        seed2,
-        i + (xNMask & this._PrimeX),
-        j + (~yNMask & this._PrimeY),
-        k + (zNMask & this._PrimeZ),
-        x6,
-        y6,
-        z0
-      );
-    } else {
-      let a7 = xAFlipMask0 + zAFlipMask0 + a0;
-      if (a7 > 0) {
-        let x7 = x0 - (xNMask | 1);
-        let y7 = y0;
-        let z7 = z0 - (zNMask | 1);
-        value += a7 * a7 * (a7 * a7) * this._GradCoordR3(
-          seed2,
-          i + (~xNMask & this._PrimeX),
-          j + (yNMask & this._PrimeY),
-          k + (~zNMask & this._PrimeZ),
-          x7,
-          y7,
-          z7
-        );
-      }
-      let a8 = yAFlipMask1 + a1;
-      if (a8 > 0) {
-        let x8 = x1;
-        let y8 = (yNMask | 1) + y1;
-        value += a8 * a8 * (a8 * a8) * this._GradCoordR3(
-          seed22,
-          i + this._PrimeX,
-          j + (yNMask & this._PrimeY << 1),
-          k + this._PrimeZ,
-          x8,
-          y8,
-          z1
-        );
-        skip9 = true;
-      }
-    }
-    let skipD = false;
-    let aA = zAFlipMask0 + a0;
-    if (aA > 0) {
-      let xA = x0;
-      let yA = y0;
-      let zA = z0 - (zNMask | 1);
-      value += aA * aA * (aA * aA) * this._GradCoordR3(
-        seed2,
-        i + (xNMask & this._PrimeX),
-        j + (yNMask & this._PrimeY),
-        k + (~zNMask & this._PrimeZ),
-        xA,
-        yA,
-        zA
-      );
-    } else {
-      let aB = xAFlipMask0 + yAFlipMask0 + a0;
-      if (aB > 0) {
-        let xB = x0 - (xNMask | 1);
-        let yB = y0 - (yNMask | 1);
-        value += aB * aB * (aB * aB) * this._GradCoordR3(
-          seed2,
-          i + (~xNMask & this._PrimeX),
-          j + (~yNMask & this._PrimeY),
-          k + (zNMask & this._PrimeZ),
-          xB,
-          yB,
-          z0
-        );
-      }
-      let aC = zAFlipMask1 + a1;
-      if (aC > 0) {
-        let xC = x1;
-        let yC = y1;
-        let zC = (zNMask | 1) + z1;
-        value += aC * aC * (aC * aC) * this._GradCoordR3(
-          seed22,
-          i + this._PrimeX,
-          j + this._PrimeY,
-          k + (zNMask & this._PrimeZ << 1),
-          xC,
-          yC,
-          zC
-        );
-        skipD = true;
-      }
-    }
-    if (!skip5) {
-      let a5 = yAFlipMask1 + zAFlipMask1 + a1;
-      if (a5 > 0) {
-        let x5 = x1;
-        let y5 = (yNMask | 1) + y1;
-        let z5 = (zNMask | 1) + z1;
-        value += a5 * a5 * (a5 * a5) * this._GradCoordR3(
-          seed22,
-          i + this._PrimeX,
-          j + (yNMask & this._PrimeY << 1),
-          k + (zNMask & this._PrimeZ << 1),
-          x5,
-          y5,
-          z5
-        );
-      }
-    }
-    if (!skip9) {
-      let a9 = xAFlipMask1 + zAFlipMask1 + a1;
-      if (a9 > 0) {
-        let x9 = (xNMask | 1) + x1;
-        let y9 = y1;
-        let z9 = (zNMask | 1) + z1;
-        value += a9 * a9 * (a9 * a9) * this._GradCoordR3(
-          seed22,
-          i + (xNMask & this._PrimeX * 2),
-          j + this._PrimeY,
-          k + (zNMask & this._PrimeZ << 1),
-          x9,
-          y9,
-          z9
-        );
-      }
-    }
-    if (!skipD) {
-      let aD = xAFlipMask1 + yAFlipMask1 + a1;
-      if (aD > 0) {
-        let xD = (xNMask | 1) + x1;
-        let yD = (yNMask | 1) + y1;
-        value += aD * aD * (aD * aD) * this._GradCoordR3(
-          seed22,
-          i + (xNMask & this._PrimeX << 1),
-          j + (yNMask & this._PrimeY << 1),
-          k + this._PrimeZ,
-          xD,
-          yD,
-          z1
-        );
-      }
-    }
-    return value * 9.046026385208288;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _SingleCellularR2(seed2, x, y) {
-    let xr = Math.round(x);
-    let yr = Math.round(y);
-    let distance0 = Number.MAX_VALUE;
-    let distance1 = Number.MAX_VALUE;
-    let closestHash = 0;
-    let cellularJitter = 0.43701595 * this._CellularJitterModifier;
-    let xPrimed = (xr - 1) * this._PrimeX;
-    let yPrimedBase = (yr - 1) * this._PrimeY;
-    switch (this._CellularDistanceFunction) {
-      default:
-      case _FastNoiseLite.CellularDistanceFunction.Euclidean:
-      case _FastNoiseLite.CellularDistanceFunction.EuclideanSq:
-        for (let xi = xr - 1; xi <= xr + 1; xi++) {
-          let yPrimed = yPrimedBase;
-          for (let yi = yr - 1; yi <= yr + 1; yi++) {
-            let hash = this._HashR2(seed2, xPrimed, yPrimed);
-            let idx = hash & 255 << 1;
-            let vecX = xi - x + this._RandVecs2D[idx] * cellularJitter;
-            let vecY = yi - y + this._RandVecs2D[idx | 1] * cellularJitter;
-            let newDistance = vecX * vecX + vecY * vecY;
-            distance1 = Math.max(Math.min(distance1, newDistance), distance0);
-            if (newDistance < distance0) {
-              distance0 = newDistance;
-              closestHash = hash;
-            }
-            yPrimed += this._PrimeY;
-          }
-          xPrimed += this._PrimeX;
-        }
-        break;
-      case _FastNoiseLite.CellularDistanceFunction.Manhattan:
-        for (let xi = xr - 1; xi <= xr + 1; xi++) {
-          let yPrimed = yPrimedBase;
-          for (let yi = yr - 1; yi <= yr + 1; yi++) {
-            let hash = this._HashR2(seed2, xPrimed, yPrimed);
-            let idx = hash & 255 << 1;
-            let vecX = xi - x + this._RandVecs2D[idx] * cellularJitter;
-            let vecY = yi - y + this._RandVecs2D[idx | 1] * cellularJitter;
-            let newDistance = Math.abs(vecX) + Math.abs(vecY);
-            distance1 = Math.max(Math.min(distance1, newDistance), distance0);
-            if (newDistance < distance0) {
-              distance0 = newDistance;
-              closestHash = hash;
-            }
-            yPrimed += this._PrimeY;
-          }
-          xPrimed += this._PrimeX;
-        }
-        break;
-      case _FastNoiseLite.CellularDistanceFunction.Hybrid:
-        for (let xi = xr - 1; xi <= xr + 1; xi++) {
-          let yPrimed = yPrimedBase;
-          for (let yi = yr - 1; yi <= yr + 1; yi++) {
-            let hash = this._HashR2(seed2, xPrimed, yPrimed);
-            let idx = hash & 255 << 1;
-            let vecX = xi - x + this._RandVecs2D[idx] * cellularJitter;
-            let vecY = yi - y + this._RandVecs2D[idx | 1] * cellularJitter;
-            let newDistance = Math.abs(vecX) + Math.abs(vecY) + (vecX * vecX + vecY * vecY);
-            distance1 = Math.max(Math.min(distance1, newDistance), distance0);
-            if (newDistance < distance0) {
-              distance0 = newDistance;
-              closestHash = hash;
-            }
-            yPrimed += this._PrimeY;
-          }
-          xPrimed += this._PrimeX;
-        }
-        break;
-    }
-    if (this._CellularDistanceFunction === _FastNoiseLite.CellularDistanceFunction.Euclidean && this._CellularReturnType !== _FastNoiseLite.CellularReturnType.CellValue) {
-      distance0 = Math.sqrt(distance0);
-      if (this._CellularReturnType !== _FastNoiseLite.CellularReturnType.CellValue) {
-        distance1 = Math.sqrt(distance1);
-      }
-    }
-    switch (this._CellularReturnType) {
-      case _FastNoiseLite.CellularReturnType.CellValue:
-        return closestHash * (1 / 2147483648);
-      case _FastNoiseLite.CellularReturnType.Distance:
-        return distance0 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2:
-        return distance1 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Add:
-        return (distance1 + distance0) * 0.5 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Sub:
-        return distance1 - distance0 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Mul:
-        return distance1 * distance0 * 0.5 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Div:
-        return distance0 / distance1 - 1;
-      default:
-        return 0;
-    }
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _SingleCellularR3(seed2, x, y, z) {
-    let xr = Math.round(x);
-    let yr = Math.round(y);
-    let zr = Math.round(z);
-    let distance0 = Number.MAX_VALUE;
-    let distance1 = Number.MAX_VALUE;
-    let closestHash = 0;
-    let cellularJitter = 0.39614353 * this._CellularJitterModifier;
-    let xPrimed = (xr - 1) * this._PrimeX;
-    let yPrimedBase = (yr - 1) * this._PrimeY;
-    let zPrimedBase = (zr - 1) * this._PrimeZ;
-    switch (this._CellularDistanceFunction) {
-      case _FastNoiseLite.CellularDistanceFunction.Euclidean:
-      case _FastNoiseLite.CellularDistanceFunction.EuclideanSq:
-        for (let xi = xr - 1; xi <= xr + 1; xi++) {
-          let yPrimed = yPrimedBase;
-          for (let yi = yr - 1; yi <= yr + 1; yi++) {
-            let zPrimed = zPrimedBase;
-            for (let zi = zr - 1; zi <= zr + 1; zi++) {
-              let hash = this._HashR3(seed2, xPrimed, yPrimed, zPrimed);
-              let idx = hash & 255 << 2;
-              let vecX = xi - x + this._RandVecs3D[idx] * cellularJitter;
-              let vecY = yi - y + this._RandVecs3D[idx | 1] * cellularJitter;
-              let vecZ = zi - z + this._RandVecs3D[idx | 2] * cellularJitter;
-              let newDistance = vecX * vecX + vecY * vecY + vecZ * vecZ;
-              distance1 = Math.max(Math.min(distance1, newDistance), distance0);
-              if (newDistance < distance0) {
-                distance0 = newDistance;
-                closestHash = hash;
-              }
-              zPrimed += this._PrimeZ;
-            }
-            yPrimed += this._PrimeY;
-          }
-          xPrimed += this._PrimeX;
-        }
-        break;
-      case _FastNoiseLite.CellularDistanceFunction.Manhattan:
-        for (let xi = xr - 1; xi <= xr + 1; xi++) {
-          let yPrimed = yPrimedBase;
-          for (let yi = yr - 1; yi <= yr + 1; yi++) {
-            let zPrimed = zPrimedBase;
-            for (let zi = zr - 1; zi <= zr + 1; zi++) {
-              let hash = this._HashR3(seed2, xPrimed, yPrimed, zPrimed);
-              let idx = hash & 255 << 2;
-              let vecX = xi - x + this._RandVecs3D[idx] * cellularJitter;
-              let vecY = yi - y + this._RandVecs3D[idx | 1] * cellularJitter;
-              let vecZ = zi - z + this._RandVecs3D[idx | 2] * cellularJitter;
-              let newDistance = Math.abs(vecX) + Math.abs(vecY) + Math.abs(vecZ);
-              distance1 = Math.max(Math.min(distance1, newDistance), distance0);
-              if (newDistance < distance0) {
-                distance0 = newDistance;
-                closestHash = hash;
-              }
-              zPrimed += this._PrimeZ;
-            }
-            yPrimed += this._PrimeY;
-          }
-          xPrimed += this._PrimeX;
-        }
-        break;
-      case _FastNoiseLite.CellularDistanceFunction.Hybrid:
-        for (let xi = xr - 1; xi <= xr + 1; xi++) {
-          let yPrimed = yPrimedBase;
-          for (let yi = yr - 1; yi <= yr + 1; yi++) {
-            let zPrimed = zPrimedBase;
-            for (let zi = zr - 1; zi <= zr + 1; zi++) {
-              let hash = this._HashR3(seed2, xPrimed, yPrimed, zPrimed);
-              let idx = hash & 255 << 2;
-              let vecX = xi - x + this._RandVecs3D[idx] * cellularJitter;
-              let vecY = yi - y + this._RandVecs3D[idx | 1] * cellularJitter;
-              let vecZ = zi - z + this._RandVecs3D[idx | 2] * cellularJitter;
-              let newDistance = Math.abs(vecX) + Math.abs(vecY) + Math.abs(vecZ) + (vecX * vecX + vecY * vecY + vecZ * vecZ);
-              distance1 = Math.max(Math.min(distance1, newDistance), distance0);
-              if (newDistance < distance0) {
-                distance0 = newDistance;
-                closestHash = hash;
-              }
-              zPrimed += this._PrimeZ;
-            }
-            yPrimed += this._PrimeY;
-          }
-          xPrimed += this._PrimeX;
-        }
-        break;
-      default:
-        break;
-    }
-    if (this._CellularDistanceFunction === _FastNoiseLite.CellularDistanceFunction.Euclidean && this._CellularReturnType !== _FastNoiseLite.CellularReturnType.CellValue) {
-      distance0 = Math.sqrt(distance0);
-      if (this._CellularReturnType !== _FastNoiseLite.CellularReturnType.CellValue) {
-        distance1 = Math.sqrt(distance1);
-      }
-    }
-    switch (this._CellularReturnType) {
-      case _FastNoiseLite.CellularReturnType.CellValue:
-        return closestHash * (1 / 2147483648);
-      case _FastNoiseLite.CellularReturnType.Distance:
-        return distance0 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2:
-        return distance1 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Add:
-        return (distance1 + distance0) * 0.5 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Sub:
-        return distance1 - distance0 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Mul:
-        return distance1 * distance0 * 0.5 - 1;
-      case _FastNoiseLite.CellularReturnType.Distance2Div:
-        return distance0 / distance1 - 1;
-      default:
-        return 0;
-    }
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _SinglePerlinR2(seed2, x, y) {
-    let x0 = Math.floor(x);
-    let y0 = Math.floor(y);
-    let xd0 = x - x0;
-    let yd0 = y - y0;
-    let xd1 = xd0 - 1;
-    let yd1 = yd0 - 1;
-    let xs = _FastNoiseLite._InterpQuintic(xd0);
-    let ys = _FastNoiseLite._InterpQuintic(yd0);
-    x0 = Math.imul(x0, this._PrimeX);
-    y0 = Math.imul(y0, this._PrimeY);
-    let x1 = x0 + this._PrimeX;
-    let y1 = y0 + this._PrimeY;
-    let xf0 = _FastNoiseLite._Lerp(
-      this._GradCoordR2(seed2, x0, y0, xd0, yd0),
-      this._GradCoordR2(seed2, x1, y0, xd1, yd0),
-      xs
-    );
-    let xf1 = _FastNoiseLite._Lerp(
-      this._GradCoordR2(seed2, x0, y1, xd0, yd1),
-      this._GradCoordR2(seed2, x1, y1, xd1, yd1),
-      xs
-    );
-    return _FastNoiseLite._Lerp(xf0, xf1, ys) * 1.4247691104677813;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _SinglePerlinR3(seed2, x, y, z) {
-    let x0 = Math.floor(x);
-    let y0 = Math.floor(y);
-    let z0 = Math.floor(z);
-    let xd0 = x - x0;
-    let yd0 = y - y0;
-    let zd0 = z - z0;
-    let xd1 = xd0 - 1;
-    let yd1 = yd0 - 1;
-    let zd1 = zd0 - 1;
-    let xs = _FastNoiseLite._InterpQuintic(xd0);
-    let ys = _FastNoiseLite._InterpQuintic(yd0);
-    let zs = _FastNoiseLite._InterpQuintic(zd0);
-    x0 = Math.imul(x0, this._PrimeX);
-    y0 = Math.imul(y0, this._PrimeY);
-    z0 = Math.imul(z0, this._PrimeZ);
-    let x1 = x0 + this._PrimeX;
-    let y1 = y0 + this._PrimeY;
-    let z1 = z0 + this._PrimeZ;
-    let xf00 = _FastNoiseLite._Lerp(
-      this._GradCoordR3(seed2, x0, y0, z0, xd0, yd0, zd0),
-      this._GradCoordR3(seed2, x1, y0, z0, xd1, yd0, zd0),
-      xs
-    );
-    let xf10 = _FastNoiseLite._Lerp(
-      this._GradCoordR3(seed2, x0, y1, z0, xd0, yd1, zd0),
-      this._GradCoordR3(seed2, x1, y1, z0, xd1, yd1, zd0),
-      xs
-    );
-    let xf01 = _FastNoiseLite._Lerp(
-      this._GradCoordR3(seed2, x0, y0, z1, xd0, yd0, zd1),
-      this._GradCoordR3(seed2, x1, y0, z1, xd1, yd0, zd1),
-      xs
-    );
-    let xf11 = _FastNoiseLite._Lerp(
-      this._GradCoordR3(seed2, x0, y1, z1, xd0, yd1, zd1),
-      this._GradCoordR3(seed2, x1, y1, z1, xd1, yd1, zd1),
-      xs
-    );
-    let yf0 = _FastNoiseLite._Lerp(xf00, xf10, ys);
-    let yf1 = _FastNoiseLite._Lerp(xf01, xf11, ys);
-    return _FastNoiseLite._Lerp(yf0, yf1, zs) * 0.9649214148521423;
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _SingleValueCubicR2(seed2, x, y) {
-    let x1 = Math.floor(x);
-    let y1 = Math.floor(y);
-    let xs = x - x1;
-    let ys = y - y1;
-    x1 = Math.imul(x1, this._PrimeX);
-    y1 = Math.imul(y1, this._PrimeY);
-    let x0 = x1 - this._PrimeX;
-    let y0 = y1 - this._PrimeY;
-    let x2 = x1 + this._PrimeX;
-    let y2 = y1 + this._PrimeY;
-    let x3 = x1 + (this._PrimeX << 1);
-    let y3 = y1 + (this._PrimeY << 1);
-    return _FastNoiseLite._CubicLerp(
-      _FastNoiseLite._CubicLerp(
-        this._ValCoordR2(seed2, x0, y0),
-        this._ValCoordR2(seed2, x1, y0),
-        this._ValCoordR2(seed2, x2, y0),
-        this._ValCoordR2(seed2, x3, y0),
-        xs
-      ),
-      _FastNoiseLite._CubicLerp(
-        this._ValCoordR2(seed2, x0, y1),
-        this._ValCoordR2(seed2, x1, y1),
-        this._ValCoordR2(seed2, x2, y1),
-        this._ValCoordR2(seed2, x3, y1),
-        xs
-      ),
-      _FastNoiseLite._CubicLerp(
-        this._ValCoordR2(seed2, x0, y2),
-        this._ValCoordR2(seed2, x1, y2),
-        this._ValCoordR2(seed2, x2, y2),
-        this._ValCoordR2(seed2, x3, y2),
-        xs
-      ),
-      _FastNoiseLite._CubicLerp(
-        this._ValCoordR2(seed2, x0, y3),
-        this._ValCoordR2(seed2, x1, y3),
-        this._ValCoordR2(seed2, x2, y3),
-        this._ValCoordR2(seed2, x3, y3),
-        xs
-      ),
-      ys
-    ) * (1 / (1.5 * 1.5));
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _SingleValueCubicR3(seed2, x, y, z) {
-    let x1 = Math.floor(x);
-    let y1 = Math.floor(y);
-    let z1 = Math.floor(z);
-    let xs = x - x1;
-    let ys = y - y1;
-    let zs = z - z1;
-    x1 = Math.imul(x1, this._PrimeX);
-    y1 = Math.imul(y1, this._PrimeY);
-    z1 = Math.imul(z1, this._PrimeZ);
-    let x0 = x1 - this._PrimeX;
-    let y0 = y1 - this._PrimeY;
-    let z0 = z1 - this._PrimeZ;
-    let x2 = x1 + this._PrimeX;
-    let y2 = y1 + this._PrimeY;
-    let z2 = z1 + this._PrimeZ;
-    let x3 = x1 + (this._PrimeX << 1);
-    let y3 = y1 + (this._PrimeY << 1);
-    let z3 = z1 + (this._PrimeZ << 1);
-    return _FastNoiseLite._CubicLerp(
-      _FastNoiseLite._CubicLerp(
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y0, z0),
-          this._ValCoordR3(seed2, x1, y0, z0),
-          this._ValCoordR3(seed2, x2, y0, z0),
-          this._ValCoordR3(seed2, x3, y0, z0),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y1, z0),
-          this._ValCoordR3(seed2, x1, y1, z0),
-          this._ValCoordR3(seed2, x2, y1, z0),
-          this._ValCoordR3(seed2, x3, y1, z0),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y2, z0),
-          this._ValCoordR3(seed2, x1, y2, z0),
-          this._ValCoordR3(seed2, x2, y2, z0),
-          this._ValCoordR3(seed2, x3, y2, z0),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y3, z0),
-          this._ValCoordR3(seed2, x1, y3, z0),
-          this._ValCoordR3(seed2, x2, y3, z0),
-          this._ValCoordR3(seed2, x3, y3, z0),
-          xs
-        ),
-        ys
-      ),
-      _FastNoiseLite._CubicLerp(
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y0, z1),
-          this._ValCoordR3(seed2, x1, y0, z1),
-          this._ValCoordR3(seed2, x2, y0, z1),
-          this._ValCoordR3(seed2, x3, y0, z1),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y1, z1),
-          this._ValCoordR3(seed2, x1, y1, z1),
-          this._ValCoordR3(seed2, x2, y1, z1),
-          this._ValCoordR3(seed2, x3, y1, z1),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y2, z1),
-          this._ValCoordR3(seed2, x1, y2, z1),
-          this._ValCoordR3(seed2, x2, y2, z1),
-          this._ValCoordR3(seed2, x3, y2, z1),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y3, z1),
-          this._ValCoordR3(seed2, x1, y3, z1),
-          this._ValCoordR3(seed2, x2, y3, z1),
-          this._ValCoordR3(seed2, x3, y3, z1),
-          xs
-        ),
-        ys
-      ),
-      _FastNoiseLite._CubicLerp(
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y0, z2),
-          this._ValCoordR3(seed2, x1, y0, z2),
-          this._ValCoordR3(seed2, x2, y0, z2),
-          this._ValCoordR3(seed2, x3, y0, z2),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y1, z2),
-          this._ValCoordR3(seed2, x1, y1, z2),
-          this._ValCoordR3(seed2, x2, y1, z2),
-          this._ValCoordR3(seed2, x3, y1, z2),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y2, z2),
-          this._ValCoordR3(seed2, x1, y2, z2),
-          this._ValCoordR3(seed2, x2, y2, z2),
-          this._ValCoordR3(seed2, x3, y2, z2),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y3, z2),
-          this._ValCoordR3(seed2, x1, y3, z2),
-          this._ValCoordR3(seed2, x2, y3, z2),
-          this._ValCoordR3(seed2, x3, y3, z2),
-          xs
-        ),
-        ys
-      ),
-      _FastNoiseLite._CubicLerp(
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y0, z3),
-          this._ValCoordR3(seed2, x1, y0, z3),
-          this._ValCoordR3(seed2, x2, y0, z3),
-          this._ValCoordR3(seed2, x3, y0, z3),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y1, z3),
-          this._ValCoordR3(seed2, x1, y1, z3),
-          this._ValCoordR3(seed2, x2, y1, z3),
-          this._ValCoordR3(seed2, x3, y1, z3),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y2, z3),
-          this._ValCoordR3(seed2, x1, y2, z3),
-          this._ValCoordR3(seed2, x2, y2, z3),
-          this._ValCoordR3(seed2, x3, y2, z3),
-          xs
-        ),
-        _FastNoiseLite._CubicLerp(
-          this._ValCoordR3(seed2, x0, y3, z3),
-          this._ValCoordR3(seed2, x1, y3, z3),
-          this._ValCoordR3(seed2, x2, y3, z3),
-          this._ValCoordR3(seed2, x3, y3, z3),
-          xs
-        ),
-        ys
-      ),
-      zs
-    ) * (1 / (1.5 * 1.5 * 1.5));
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @returns {number}
-   */
-  _SingleValueR2(seed2, x, y) {
-    let x0 = Math.floor(x);
-    let y0 = Math.floor(y);
-    let xs = _FastNoiseLite._InterpHermite(x - x0);
-    let ys = _FastNoiseLite._InterpHermite(y - y0);
-    x0 = Math.imul(x0, this._PrimeX);
-    y0 = Math.imul(y0, this._PrimeY);
-    let x1 = x0 + this._PrimeX;
-    let y1 = y0 + this._PrimeY;
-    let xf0 = _FastNoiseLite._Lerp(this._ValCoordR2(seed2, x0, y0), this._ValCoordR2(seed2, x1, y0), xs);
-    let xf1 = _FastNoiseLite._Lerp(this._ValCoordR2(seed2, x0, y1), this._ValCoordR2(seed2, x1, y1), xs);
-    return _FastNoiseLite._Lerp(xf0, xf1, ys);
-  }
-  /**
-   * @private
-   * @param {number} seed
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   * @returns {number}
-   */
-  _SingleValueR3(seed2, x, y, z) {
-    let x0 = Math.floor(x);
-    let y0 = Math.floor(y);
-    let z0 = Math.floor(z);
-    let xs = _FastNoiseLite._InterpHermite(x - x0);
-    let ys = _FastNoiseLite._InterpHermite(y - y0);
-    let zs = _FastNoiseLite._InterpHermite(z - z0);
-    x0 = Math.imul(x0, this._PrimeX);
-    y0 = Math.imul(y0, this._PrimeY);
-    z0 = Math.imul(z0, this._PrimeZ);
-    let x1 = x0 + this._PrimeX;
-    let y1 = y0 + this._PrimeY;
-    let z1 = z0 + this._PrimeZ;
-    let xf00 = _FastNoiseLite._Lerp(
-      this._ValCoordR3(seed2, x0, y0, z0),
-      this._ValCoordR3(seed2, x1, y0, z0),
-      xs
-    );
-    let xf10 = _FastNoiseLite._Lerp(
-      this._ValCoordR3(seed2, x0, y1, z0),
-      this._ValCoordR3(seed2, x1, y1, z0),
-      xs
-    );
-    let xf01 = _FastNoiseLite._Lerp(
-      this._ValCoordR3(seed2, x0, y0, z1),
-      this._ValCoordR3(seed2, x1, y0, z1),
-      xs
-    );
-    let xf11 = _FastNoiseLite._Lerp(
-      this._ValCoordR3(seed2, x0, y1, z1),
-      this._ValCoordR3(seed2, x1, y1, z1),
-      xs
-    );
-    let yf0 = _FastNoiseLite._Lerp(xf00, xf10, ys);
-    let yf1 = _FastNoiseLite._Lerp(xf01, xf11, ys);
-    return _FastNoiseLite._Lerp(yf0, yf1, zs);
-  }
-  /**
-   * @private
-   */
-  _DoSingleDomainWarp() {
-    let R2 = (seed2, amp, freq, coord, x, y) => {
-      switch (this._DomainWarpType) {
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2:
-          this._SingleDomainWarpOpenSimplex2Gradient(
-            seed2,
-            amp * 38.283687591552734,
-            freq,
-            coord,
-            false,
-            x,
-            y
-          );
-          break;
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2Reduced:
-          this._SingleDomainWarpOpenSimplex2Gradient(
-            seed2,
-            amp * 16,
-            freq,
-            coord,
-            true,
-            x,
-            y
-          );
-          break;
-        case _FastNoiseLite.DomainWarpType.BasicGrid:
-          this._SingleDomainWarpBasicGrid(seed2, amp, freq, coord, x, y);
-          break;
-      }
-    };
-    let R3 = (seed2, amp, freq, coord, x, y, z) => {
-      switch (this._DomainWarpType) {
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2:
-          this._SingleDomainWarpOpenSimplex2Gradient(
-            seed2,
-            amp * 32.69428253173828,
-            freq,
-            coord,
-            false,
-            x,
-            y,
-            z
-          );
-          break;
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2Reduced:
-          this._SingleDomainWarpOpenSimplex2Gradient(
-            seed2,
-            amp * 7.71604938271605,
-            freq,
-            coord,
-            true,
-            x,
-            y,
-            z
-          );
-          break;
-        case _FastNoiseLite.DomainWarpType.BasicGrid:
-          this._SingleDomainWarpBasicGrid(seed2, amp, freq, coord, x, y, z);
-          break;
-      }
-    };
-    if (arguments.length === 6 && arguments[3] instanceof Vector2) {
-      return R2(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]);
-    }
-    if (arguments.length === 7 && arguments[3] instanceof Vector331) {
-      return R3(
-        arguments[0],
-        arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-        arguments[5],
-        arguments[6]
-      );
-    }
-  }
-  /**
-   * @private
-   */
-  _DomainWarpSingle() {
-    let R2 = (coord) => {
-      let seed2 = this._Seed;
-      let amp = this._DomainWarpAmp * this._FractalBounding;
-      let freq = this._Frequency;
-      let xs = coord.x;
-      let ys = coord.y;
-      switch (this._DomainWarpType) {
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2:
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2Reduced:
-          const SQRT3 = 1.7320508075688772;
-          const F2 = 0.5 * (SQRT3 - 1);
-          let t = (xs + ys) * F2;
-          xs += t;
-          ys += t;
-          break;
-        default:
-          break;
-      }
-      this._DoSingleDomainWarp(seed2, amp, freq, coord, xs, ys);
-    };
-    let R3 = (coord) => {
-      let seed2 = this._Seed;
-      let amp = this._DomainWarpAmp * this._FractalBounding;
-      let freq = this._Frequency;
-      let xs = coord.x;
-      let ys = coord.y;
-      let zs = coord.z;
-      switch (this._WarpTransformType3D) {
-        case _FastNoiseLite.TransformType3D.ImproveXYPlanes:
-          {
-            let xy = xs + ys;
-            let s2 = xy * -0.211324865405187;
-            zs *= 0.577350269189626;
-            xs += s2 - zs;
-            ys = ys + s2 - zs;
-            zs += xy * 0.577350269189626;
-          }
-          break;
-        case _FastNoiseLite.TransformType3D.ImproveXZPlanes:
-          {
-            let xz = xs + zs;
-            let s2 = xz * -0.211324865405187;
-            ys *= 0.577350269189626;
-            xs += s2 - ys;
-            zs += s2 - ys;
-            ys += xz * 0.577350269189626;
-          }
-          break;
-        case _FastNoiseLite.TransformType3D.DefaultOpenSimplex2:
-          const R32 = 2 / 3;
-          let r = (xs + ys + zs) * R32;
-          xs = r - xs;
-          ys = r - ys;
-          zs = r - zs;
-          break;
-        default:
-          break;
-      }
-      this._DoSingleDomainWarp(seed2, amp, freq, coord, xs, ys, zs);
-    };
-    if (arguments.length === 1 && arguments[0] instanceof Vector2) {
-      return R2(arguments[0]);
-    }
-    if (arguments.length === 1 && arguments[0] instanceof Vector331) {
-      return R3(arguments[0]);
-    }
-  }
-  _DomainWarpFractalProgressive() {
-    let R2 = (coord) => {
-      let seed2 = this._Seed;
-      let amp = this._DomainWarpAmp * this._FractalBounding;
-      let freq = this._Frequency;
-      for (let i = 0; i < this._Octaves; i++) {
-        let xs = coord.x;
-        let ys = coord.y;
-        switch (this._DomainWarpType) {
-          case _FastNoiseLite.DomainWarpType.OpenSimplex2:
-          case _FastNoiseLite.DomainWarpType.OpenSimplex2Reduced:
-            const SQRT3 = 1.7320508075688772;
-            const F2 = 0.5 * (SQRT3 - 1);
-            let t = (xs + ys) * F2;
-            xs += t;
-            ys += t;
-            break;
-          default:
-            break;
-        }
-        this._DoSingleDomainWarp(seed2, amp, freq, coord, xs, ys);
-        seed2++;
-        amp *= this._Gain;
-        freq *= this._Lacunarity;
-      }
-    };
-    let R3 = (coord) => {
-      let seed2 = this._Seed;
-      let amp = this._DomainWarpAmp * this._FractalBounding;
-      let freq = this._Frequency;
-      for (let i = 0; i < this._Octaves; i++) {
-        let xs = coord.x;
-        let ys = coord.y;
-        let zs = coord.z;
-        switch (this._WarpTransformType3D) {
-          case _FastNoiseLite.TransformType3D.ImproveXYPlanes:
-            {
-              let xy = xs + ys;
-              let s2 = xy * -0.211324865405187;
-              zs *= 0.577350269189626;
-              xs += s2 - zs;
-              ys = ys + s2 - zs;
-              zs += xy * 0.577350269189626;
-            }
-            break;
-          case _FastNoiseLite.TransformType3D.ImproveXZPlanes:
-            {
-              let xz = xs + zs;
-              let s2 = xz * -0.211324865405187;
-              ys *= 0.577350269189626;
-              xs += s2 - ys;
-              zs += s2 - ys;
-              ys += xz * 0.577350269189626;
-            }
-            break;
-          case _FastNoiseLite.TransformType3D.DefaultOpenSimplex2:
-            {
-              const R32 = 2 / 3;
-              let r = (xs + ys + zs) * R32;
-              xs = r - xs;
-              ys = r - ys;
-              zs = r - zs;
-            }
-            break;
-          default:
-            break;
-        }
-        this._DoSingleDomainWarp(seed2, amp, freq, coord, xs, ys, zs);
-        seed2++;
-        amp *= this._Gain;
-        freq *= this._Lacunarity;
-      }
-    };
-    if (arguments.length === 1 && arguments[0] instanceof Vector2) {
-      return R2(arguments[0]);
-    }
-    if (arguments.length === 1 && arguments[0] instanceof Vector331) {
-      return R3(arguments[0]);
-    }
-  }
-  /**
-   * @private
-   */
-  _DomainWarpFractalIndependent() {
-    let R2 = (coord) => {
-      let xs = coord.x;
-      let ys = coord.y;
-      switch (this._DomainWarpType) {
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2:
-        case _FastNoiseLite.DomainWarpType.OpenSimplex2Reduced:
-          const SQRT3 = 1.7320508075688772;
-          const F2 = 0.5 * (SQRT3 - 1);
-          let t = (xs + ys) * F2;
-          xs += t;
-          ys += t;
-          break;
-        default:
-          break;
-      }
-      let seed2 = this._Seed;
-      let amp = this._DomainWarpAmp * this._FractalBounding;
-      let freq = this._Frequency;
-      for (let i = 0; i < this._Octaves; i++) {
-        this._DoSingleDomainWarp(seed2, amp, freq, coord, xs, ys);
-        seed2++;
-        amp *= this._Gain;
-        freq *= this._Lacunarity;
-      }
-    };
-    let R3 = (coord) => {
-      let xs = coord.x;
-      let ys = coord.y;
-      let zs = coord.z;
-      switch (this._WarpTransformType3D) {
-        case _FastNoiseLite.TransformType3D.ImproveXYPlanes:
-          {
-            let xy = xs + ys;
-            let s2 = xy * -0.211324865405187;
-            zs *= 0.577350269189626;
-            xs += s2 - zs;
-            ys = ys + s2 - zs;
-            zs += xy * 0.577350269189626;
-          }
-          break;
-        case _FastNoiseLite.TransformType3D.ImproveXZPlanes:
-          {
-            let xz = xs + zs;
-            let s2 = xz * -0.211324865405187;
-            ys *= 0.577350269189626;
-            xs += s2 - ys;
-            zs += s2 - ys;
-            ys += xz * 0.577350269189626;
-          }
-          break;
-        case _FastNoiseLite.TransformType3D.DefaultOpenSimplex2:
-          {
-            const R32 = 2 / 3;
-            let r = (xs + ys + zs) * R32;
-            xs = r - xs;
-            ys = r - ys;
-            zs = r - zs;
-          }
-          break;
-        default:
-          break;
-      }
-      let seed2 = this._Seed;
-      let amp = this._DomainWarpAmp * this._FractalBounding;
-      let freq = this._Frequency;
-      for (let i = 0; i < this._Octaves; i++) {
-        this._DoSingleDomainWarp(seed2, amp, freq, coord, xs, ys, zs);
-        seed2++;
-        amp *= this._Gain;
-        freq *= this._Lacunarity;
-      }
-    };
-    if (arguments.length === 1 && arguments[0] instanceof Vector2) {
-      return R2(arguments[0]);
-    }
-    if (arguments.length === 1 && arguments[0] instanceof Vector331) {
-      return R3(arguments[0]);
-    }
-  }
-  /**
-   * @private
-   */
-  _SingleDomainWarpBasicGrid() {
-    let R2 = (seed2, warpAmp, frequency, coord, x, y) => {
-      let xf = x * frequency;
-      let yf = y * frequency;
-      let x0 = Math.floor(xf);
-      let y0 = Math.floor(yf);
-      let xs = _FastNoiseLite._InterpHermite(xf - x0);
-      let ys = _FastNoiseLite._InterpHermite(yf - y0);
-      x0 = Math.imul(x0, this._PrimeX);
-      y0 = Math.imul(y0, this._PrimeY);
-      let x1 = x0 + this._PrimeX;
-      let y1 = y0 + this._PrimeY;
-      let hash0 = this._HashR2(seed2, x0, y0) & 255 << 1;
-      let hash1 = this._HashR2(seed2, x1, y0) & 255 << 1;
-      let lx0x = _FastNoiseLite._Lerp(this._RandVecs2D[hash0], this._RandVecs2D[hash1], xs);
-      let ly0x = _FastNoiseLite._Lerp(this._RandVecs2D[hash0 | 1], this._RandVecs2D[hash1 | 1], xs);
-      hash0 = this._HashR2(seed2, x0, y1) & 255 << 1;
-      hash1 = this._HashR2(seed2, x1, y1) & 255 << 1;
-      let lx1x = _FastNoiseLite._Lerp(this._RandVecs2D[hash0], this._RandVecs2D[hash1], xs);
-      let ly1x = _FastNoiseLite._Lerp(this._RandVecs2D[hash0 | 1], this._RandVecs2D[hash1 | 1], xs);
-      coord.x += _FastNoiseLite._Lerp(lx0x, lx1x, ys) * warpAmp;
-      coord.y += _FastNoiseLite._Lerp(ly0x, ly1x, ys) * warpAmp;
-    };
-    let R3 = (seed2, warpAmp, frequency, coord, x, y, z) => {
-      let xf = x * frequency;
-      let yf = y * frequency;
-      let zf = z * frequency;
-      let x0 = Math.floor(xf);
-      let y0 = Math.floor(yf);
-      let z0 = Math.floor(zf);
-      let xs = _FastNoiseLite._InterpHermite(xf - x0);
-      let ys = _FastNoiseLite._InterpHermite(yf - y0);
-      let zs = _FastNoiseLite._InterpHermite(zf - z0);
-      x0 = Math.imul(x0, this._PrimeX);
-      y0 = Math.imul(y0, this._PrimeY);
-      z0 = Math.imul(z0, this._PrimeZ);
-      let x1 = x0 + this._PrimeX;
-      let y1 = y0 + this._PrimeY;
-      let z1 = z0 + this._PrimeZ;
-      let hash0 = this._HashR3(seed2, x0, y0, z0) & 255 << 2;
-      let hash1 = this._HashR3(seed2, x1, y0, z0) & 255 << 2;
-      let lx0x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0], this._RandVecs3D[hash1], xs);
-      let ly0x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 1], this._RandVecs3D[hash1 | 1], xs);
-      let lz0x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 2], this._RandVecs3D[hash1 | 2], xs);
-      hash0 = this._HashR3(seed2, x0, y1, z0) & 255 << 2;
-      hash1 = this._HashR3(seed2, x1, y1, z0) & 255 << 2;
-      let lx1x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0], this._RandVecs3D[hash1], xs);
-      let ly1x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 1], this._RandVecs3D[hash1 | 1], xs);
-      let lz1x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 2], this._RandVecs3D[hash1 | 2], xs);
-      let lx0y = _FastNoiseLite._Lerp(lx0x, lx1x, ys);
-      let ly0y = _FastNoiseLite._Lerp(ly0x, ly1x, ys);
-      let lz0y = _FastNoiseLite._Lerp(lz0x, lz1x, ys);
-      hash0 = this._HashR3(seed2, x0, y0, z1) & 255 << 2;
-      hash1 = this._HashR3(seed2, x1, y0, z1) & 255 << 2;
-      lx0x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0], this._RandVecs3D[hash1], xs);
-      ly0x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 1], this._RandVecs3D[hash1 | 1], xs);
-      lz0x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 2], this._RandVecs3D[hash1 | 2], xs);
-      hash0 = this._HashR3(seed2, x0, y1, z1) & 255 << 2;
-      hash1 = this._HashR3(seed2, x1, y1, z1) & 255 << 2;
-      lx1x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0], this._RandVecs3D[hash1], xs);
-      ly1x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 1], this._RandVecs3D[hash1 | 1], xs);
-      lz1x = _FastNoiseLite._Lerp(this._RandVecs3D[hash0 | 2], this._RandVecs3D[hash1 | 2], xs);
-      coord.x += _FastNoiseLite._Lerp(lx0y, _FastNoiseLite._Lerp(lx0x, lx1x, ys), zs) * warpAmp;
-      coord.y += _FastNoiseLite._Lerp(ly0y, _FastNoiseLite._Lerp(ly0x, ly1x, ys), zs) * warpAmp;
-      coord.z += _FastNoiseLite._Lerp(lz0y, _FastNoiseLite._Lerp(lz0x, lz1x, ys), zs) * warpAmp;
-    };
-    if (arguments.length === 6 && arguments[3] instanceof Vector2) {
-      R2(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]);
-    }
-    if (arguments.length === 7 && arguments[3] instanceof Vector331) {
-      R3(
-        arguments[0],
-        arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-        arguments[5],
-        arguments[6]
-      );
-    }
-  }
-  /**
-   * @private
-   */
-  _SingleDomainWarpOpenSimplex2Gradient() {
-    let R2 = (seed2, warpAmp, frequency, coord, outGradOnly, x, y) => {
-      const SQRT3 = 1.7320508075688772;
-      const G2 = (3 - SQRT3) / 6;
-      x *= frequency;
-      y *= frequency;
-      let i = Math.floor(x);
-      let j = Math.floor(y);
-      let xi = x - i;
-      let yi = y - j;
-      let t = (xi + yi) * G2;
-      let x0 = xi - t;
-      let y0 = yi - t;
-      i = Math.imul(i, this._PrimeX);
-      j = Math.imul(j, this._PrimeY);
-      let vx, vy;
-      vx = vy = 0;
-      let a = 0.5 - x0 * x0 - y0 * y0;
-      if (a > 0) {
-        let aaaa = a * a * (a * a);
-        let xo, yo;
-        if (outGradOnly) {
-          let hash = this._HashR2(seed2, i, j) & 255 << 1;
-          xo = this._RandVecs2D[hash];
-          yo = this._RandVecs2D[hash | 1];
-        } else {
-          let hash = this._HashR2(seed2, i, j);
-          let index1 = hash & 127 << 1;
-          let index2 = hash >> 7 & 255 << 1;
-          let xg = this._Gradients2D[index1];
-          let yg = this._Gradients2D[index1 | 1];
-          let value = x0 * xg + y0 * yg;
-          let xgo = this._RandVecs2D[index2];
-          let ygo = this._RandVecs2D[index2 | 1];
-          xo = value * xgo;
-          yo = value * ygo;
-        }
-        vx += aaaa * xo;
-        vy += aaaa * yo;
-      }
-      let c = 2 * (1 - 2 * G2) * (1 / G2 - 2) * t + (-2 * (1 - 2 * G2) * (1 - 2 * G2) + a);
-      if (c > 0) {
-        let x2 = x0 + (2 * G2 - 1);
-        let y2 = y0 + (2 * G2 - 1);
-        let cccc = c * c * (c * c);
-        let xo, yo;
-        if (outGradOnly) {
-          let hash = this._HashR2(seed2, i + this._PrimeX, j + this._PrimeY) & 255 << 1;
-          xo = this._RandVecs2D[hash];
-          yo = this._RandVecs2D[hash | 1];
-        } else {
-          let hash = this._HashR2(seed2, i + this._PrimeX, j + this._PrimeY);
-          let index1 = hash & 127 << 1;
-          let index2 = hash >> 7 & 255 << 1;
-          let xg = this._Gradients2D[index1];
-          let yg = this._Gradients2D[index1 | 1];
-          let value = x2 * xg + y2 * yg;
-          let xgo = this._RandVecs2D[index2];
-          let ygo = this._RandVecs2D[index2 | 1];
-          xo = value * xgo;
-          yo = value * ygo;
-        }
-        vx += cccc * xo;
-        vy += cccc * yo;
-      }
-      if (y0 > x0) {
-        let x1 = x0 + G2;
-        let y1 = y0 + (G2 - 1);
-        let b = 0.5 - x1 * x1 - y1 * y1;
-        if (b > 0) {
-          let bbbb = b * b * (b * b);
-          let xo, yo;
-          if (outGradOnly) {
-            let hash = this._HashR2(seed2, i, j + this._PrimeY) & 255 << 1;
-            xo = this._RandVecs2D[hash];
-            yo = this._RandVecs2D[hash | 1];
-          } else {
-            let hash = this._HashR2(seed2, i, j + this._PrimeY);
-            let index1 = hash & 127 << 1;
-            let index2 = hash >> 7 & 255 << 1;
-            let xg = this._Gradients2D[index1];
-            let yg = this._Gradients2D[index1 | 1];
-            let value = x1 * xg + y1 * yg;
-            let xgo = this._RandVecs2D[index2];
-            let ygo = this._RandVecs2D[index2 | 1];
-            xo = value * xgo;
-            yo = value * ygo;
-          }
-          vx += bbbb * xo;
-          vy += bbbb * yo;
-        }
-      } else {
-        let x1 = x0 + (G2 - 1);
-        let y1 = y0 + G2;
-        let b = 0.5 - x1 * x1 - y1 * y1;
-        if (b > 0) {
-          let bbbb = b * b * (b * b);
-          let xo, yo;
-          if (outGradOnly) {
-            let hash = this._HashR2(seed2, i + this._PrimeX, j) & 255 << 1;
-            xo = this._RandVecs2D[hash];
-            yo = this._RandVecs2D[hash | 1];
-          } else {
-            let hash = this._HashR2(seed2, i + this._PrimeX, j);
-            let index1 = hash & 127 << 1;
-            let index2 = hash >> 7 & 255 << 1;
-            let xg = this._Gradients2D[index1];
-            let yg = this._Gradients2D[index1 | 1];
-            let value = x1 * xg + y1 * yg;
-            let xgo = this._RandVecs2D[index2];
-            let ygo = this._RandVecs2D[index2 | 1];
-            xo = value * xgo;
-            yo = value * ygo;
-          }
-          vx += bbbb * xo;
-          vy += bbbb * yo;
-        }
-      }
-      coord.x += vx * warpAmp;
-      coord.y += vy * warpAmp;
-    };
-    let R3 = (seed2, warpAmp, frequency, coord, outGradOnly, x, y, z) => {
-      x *= frequency;
-      y *= frequency;
-      z *= frequency;
-      let i = Math.round(x);
-      let j = Math.round(y);
-      let k = Math.round(z);
-      let x0 = x - i;
-      let y0 = y - j;
-      let z0 = z - k;
-      let xNSign = -x0 - 1 | 1;
-      let yNSign = -y0 - 1 | 1;
-      let zNSign = -z0 - 1 | 1;
-      let ax0 = xNSign * -x0;
-      let ay0 = yNSign * -y0;
-      let az0 = zNSign * -z0;
-      i = Math.imul(i, this._PrimeX);
-      j = Math.imul(j, this._PrimeY);
-      k = Math.imul(k, this._PrimeZ);
-      let vx, vy, vz;
-      vx = vy = vz = 0;
-      let a = 0.6 - x0 * x0 - (y0 * y0 + z0 * z0);
-      for (let l = 0; ; l++) {
-        if (a > 0) {
-          let aaaa = a * a * (a * a);
-          let xo, yo, zo;
-          if (outGradOnly) {
-            let hash = this._HashR3(seed2, i, j, k) & 255 << 2;
-            xo = this._RandVecs3D[hash];
-            yo = this._RandVecs3D[hash | 1];
-            zo = this._RandVecs3D[hash | 2];
-          } else {
-            let hash = this._HashR3(seed2, i, j, k);
-            let index1 = hash & 63 << 2;
-            let index2 = hash >> 6 & 255 << 2;
-            let xg = this._Gradients3D[index1];
-            let yg = this._Gradients3D[index1 | 1];
-            let zg = this._Gradients3D[index1 | 2];
-            let value = x0 * xg + y0 * yg + z0 * zg;
-            let xgo = this._RandVecs3D[index2];
-            let ygo = this._RandVecs3D[index2 | 1];
-            let zgo = this._RandVecs3D[index2 | 2];
-            xo = value * xgo;
-            yo = value * ygo;
-            zo = value * zgo;
-          }
-          vx += aaaa * xo;
-          vy += aaaa * yo;
-          vz += aaaa * zo;
-        }
-        let b = a;
-        let i1 = i;
-        let j1 = j;
-        let k1 = k;
-        let x1 = x0;
-        let y1 = y0;
-        let z1 = z0;
-        if (ax0 >= ay0 && ax0 >= az0) {
-          x1 += xNSign;
-          b = b + ax0 + ax0;
-          i1 -= xNSign * this._PrimeX;
-        } else if (ay0 > ax0 && ay0 >= az0) {
-          y1 += yNSign;
-          b = b + ay0 + ay0;
-          j1 -= yNSign * this._PrimeY;
-        } else {
-          z1 += zNSign;
-          b = b + az0 + az0;
-          k1 -= zNSign * this._PrimeZ;
-        }
-        if (b > 1) {
-          b -= 1;
-          let bbbb = b * b * (b * b);
-          let xo, yo, zo;
-          if (outGradOnly) {
-            let hash = this._HashR3(seed2, i1, j1, k1) & 255 << 2;
-            xo = this._RandVecs3D[hash];
-            yo = this._RandVecs3D[hash | 1];
-            zo = this._RandVecs3D[hash | 2];
-          } else {
-            let hash = this._HashR3(seed2, i1, j1, k1);
-            let index1 = hash & 63 << 2;
-            let index2 = hash >> 6 & 255 << 2;
-            let xg = this._Gradients3D[index1];
-            let yg = this._Gradients3D[index1 | 1];
-            let zg = this._Gradients3D[index1 | 2];
-            let value = x1 * xg + y1 * yg + z1 * zg;
-            let xgo = this._RandVecs3D[index2];
-            let ygo = this._RandVecs3D[index2 | 1];
-            let zgo = this._RandVecs3D[index2 | 2];
-            xo = value * xgo;
-            yo = value * ygo;
-            zo = value * zgo;
-          }
-          vx += bbbb * xo;
-          vy += bbbb * yo;
-          vz += bbbb * zo;
-        }
-        if (l === 1) break;
-        ax0 = 0.5 - ax0;
-        ay0 = 0.5 - ay0;
-        az0 = 0.5 - az0;
-        x0 = xNSign * ax0;
-        y0 = yNSign * ay0;
-        z0 = zNSign * az0;
-        a += 0.75 - ax0 - (ay0 + az0);
-        i += xNSign >> 1 & this._PrimeX;
-        j += yNSign >> 1 & this._PrimeY;
-        k += zNSign >> 1 & this._PrimeZ;
-        xNSign = -xNSign;
-        yNSign = -yNSign;
-        zNSign = -zNSign;
-        seed2 += 1293373;
-      }
-      coord.x += vx * warpAmp;
-      coord.y += vy * warpAmp;
-      coord.z += vz * warpAmp;
-    };
-    if (arguments.length === 7) {
-      R2(
-        arguments[0],
-        arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-        arguments[5],
-        arguments[6]
-      );
-    }
-    if (arguments.length === 8) {
-      R3(
-        arguments[0],
-        arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-        arguments[5],
-        arguments[6],
-        arguments[7]
-      );
-    }
-  }
-};
-var Vector2 = class {
-  /**
-   * 2d Vector
-   * @param {number} x
-   * @param {number} y
-   */
-  constructor(x, y) {
-    this.x = x;
-    this.y = y;
-  }
-};
-var Vector331 = class {
-  /**
-   * 3d Vector
-   * @param {number} x
-   * @param {number} y
-   * @param {number} z
-   */
-  constructor(x, y, z) {
-    this.x = x;
-    this.y = y;
-    this.z = z;
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/utils/random.ts
-var ProceduralRandom = class _ProceduralRandom {
-  static getNumber(pos, seed2) {
-    const BIT_NOISE1 = 1759714724;
-    const BIT_NOISE2 = 3039394381;
-    const BIT_NOISE3 = 458671337;
-    let mangledBits = pos & 2147483647;
-    mangledBits *= BIT_NOISE1;
-    mangledBits += seed2;
-    mangledBits ^= mangledBits >> 8;
-    mangledBits += BIT_NOISE2;
-    mangledBits ^= mangledBits << 8;
-    mangledBits *= BIT_NOISE3;
-    mangledBits ^= mangledBits >> 8;
-    return mangledBits;
-  }
-  seed;
-  index;
-  constructor(seed2) {
-    this.seed = Math.floor(seed2);
-    this.index = 0;
-  }
-  getInt(r) {
-    return _ProceduralRandom.getNumber(r, this.seed);
-  }
-  getFloat(r) {
-    return this.getInt(r) / 2147483647;
-  }
-  getInt2(x, z) {
-    return this.getInt(x + z * 999999937);
-  }
-  nextInt() {
-    return this.getInt(this.index++);
-  }
-  nextFloat() {
-    return this.getFloat(this.index++);
-  }
-  getSeqence(x, z) {
-    return new _ProceduralRandom(this.getInt(x + z * 999999937));
-  }
-};
-Array.prototype.random = function(r = Math.random()) {
-  return this[Math.floor(r * this.length)];
-};
-String.prototype.toArray = function(num) {
-  return new Array(num ?? 1).fill(this);
-};
-
-// src/main/bedrock/ts/world/worldgen/core/utils/ease-ing.ts
-var c1 = 1.70158;
-var c2 = c1 * 1.525;
-var c3 = c1 + 1;
-
-// src/main/bedrock/ts/world/worldgen/core/utils/paletted-placer.ts
-import { ListBlockVolume } from "@minecraft/server";
-var PalettedPlacer = class {
-  palettes;
-  constructor() {
-    this.palettes = /* @__PURE__ */ new Map();
-  }
-  getPaletteLocations(permutation) {
-    return this.palettes.get(permutation) ?? [];
-  }
-  setPaletteLocations(permutation, locations) {
-    this.palettes.set(permutation, locations);
-  }
-  setBlock(location, permutation) {
-    let list = this.palettes.get(permutation);
-    if (!list) {
-      list = [];
-      this.palettes.set(permutation, list);
-    }
-    list.push(location);
-  }
-  *flush(dimension, filterOption) {
-    for (const [permutation, list] of this.palettes.entries()) {
-      if (!list.length) continue;
-      const slices = /* @__PURE__ */ new Map();
-      for (const loc of list) {
-        const cx = Math.floor(loc.x / 16);
-        const cy = Math.floor(loc.y / 16);
-        const cz = Math.floor(loc.z / 16);
-        const key = `${cx},${cy},${cz}`;
-        let sliceList = slices.get(key);
-        if (!sliceList) {
-          sliceList = [];
-          slices.set(key, sliceList);
-        }
-        sliceList.push(loc);
-      }
-      for (const sliceList of slices.values()) {
-        dimension.fillBlocks(new ListBlockVolume(sliceList), permutation, filterOption ?? {});
-        yield;
-      }
-    }
-    this.palettes.clear();
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/utils/paletted-brush.ts
-import { BlockPermutation as BlockPermutation17 } from "@minecraft/server";
-var PalettedBrush = class {
-  permutations;
-  resolved;
-  constructor() {
-    this.permutations = [];
-    this.resolved = [];
-  }
-  add(type2, repeat) {
-    const count = repeat ?? 1;
-    for (let i = 0; i < count; i++) {
-      this.permutations.push(type2);
-    }
-    return this;
-  }
-  addArray(list) {
-    for (const entry of list) this.add(entry);
-    return this;
-  }
-  resolveAll() {
-    if (this.resolved.length === this.permutations.length) return;
-    this.resolved = this.permutations.map((p) => {
-      if (typeof p === "string") {
-        try {
-          return BlockPermutation17.resolve(p);
-        } catch (e) {
-          return BlockPermutation17.resolve("minecraft:air");
-        }
-      }
-      return p;
-    });
-  }
-  next(r = Math.random()) {
-    this.resolveAll();
-    return this.resolved[Math.floor(r * this.resolved.length)] ?? BlockPermutation17.resolve("minecraft:air");
-  }
-  toPermutation(r) {
-    return this.next(r);
-  }
-  /** Returns the raw string block ID (or BlockPermutation) without resolving.
-   *  This is safe to pass directly to fillBlocks() which accepts string | BlockPermutation. */
-  toBlockId(r) {
-    if (!this.permutations.length) return "minecraft:air";
-    return this.permutations[Math.floor(r * this.permutations.length)];
-  }
-};
-PalettedBrush.prototype.toPermutation = PalettedBrush.prototype.next;
-BlockPermutation17.prototype.toPermutation = function(r) {
-  return this;
-};
-String.prototype.toPermutation = function(r) {
-  return BlockPermutation17.resolve(this);
-};
-
-// src/main/bedrock/ts/world/worldgen/core/utils/event.ts
-var sessions = /* @__PURE__ */ new WeakMap();
-var PublicEvent = class {
-  constructor() {
-    sessions.set(this, /* @__PURE__ */ new Set());
-  }
-  subscribe(method) {
-    const t = typeof method;
-    if (t !== "function")
-      throw new TypeError(`Expected a function, but got ${t}.`);
-    if (sessions.has(this)) {
-      const set = sessions.get(this);
-      if (set && !set.has(method))
-        set.add(method);
-    }
-    return method;
-  }
-  unsubscribe(method) {
-    const t = typeof method;
-    if (t !== "function")
-      throw new TypeError(`Expected a function, but got ${t}.`);
-    if (sessions.has(this))
-      sessions.get(this)?.delete(method);
-    return method;
-  }
-};
-var NativeEvent = class extends PublicEvent {
-  async trigger(...params) {
-    if (sessions.has(this)) {
-      const promises = [];
-      sessions.get(this)?.forEach((method) => {
-        promises.push((async () => method(...params))().catch((e) => console.error(e, e.stack)));
-      });
-      await Promise.all(promises);
-    }
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/utils/functions.ts
-import { system as system35 } from "@minecraft/server";
-var delay = system35.waitTicks.bind(system35);
-
-// src/main/bedrock/ts/world/worldgen/core/client/index.ts
-import { world as world34 } from "@minecraft/server";
-
-// src/main/bedrock/ts/world/worldgen/core/client/local-chunks.ts
-import { system as system36 } from "@minecraft/server";
-var CLIENT_CHUNKS = /* @__PURE__ */ new WeakMap();
-var MAX_RETRIES = 3;
-var ClientChunk = class {
-  static open(sessionManager, player) {
-    let m = CLIENT_CHUNKS.get(player);
-    if (!m) CLIENT_CHUNKS.set(player, m = new this(player, sessionManager));
-    return m;
-  }
-  player;
-  manager;
-  lastVisitedChunk = "";
-  id = void 0;
-  chunkQueue = [];
-  queuedChunks = /* @__PURE__ */ new Set();
-  activeJobs = 0;
-  maxJobs = 3;
-  constructor(player, sessionManager) {
-    this.player = player;
-    this.manager = sessionManager;
-  }
-  get chunkXZ() {
-    const { x, z } = this.player.location;
-    return { x: Math.floor(x / 16), z: Math.floor(z / 16) };
-  }
-  get isRunning() {
-    return typeof this.id === "number";
-  }
-  get currentGenerator() {
-    return this.manager.get(this.player.dimension);
-  }
-  getKey(loc) {
-    return `${loc.x};${loc.z}`;
-  }
-  start() {
-    this.id = system36.runInterval(() => {
-      try {
-        this._tick();
-      } catch (e) {
-        console.error(e);
-      }
-    });
-  }
-  stop() {
-    if (this.isRunning && this.id !== void 0) system36.clearRun(this.id);
-  }
-  _tick() {
-    if (!this.player.dimension.id.startsWith("gaiadimension:")) return;
-    const gen = this.currentGenerator;
-    if (!gen) return;
-    const { x: X, z: Z } = this.chunkXZ;
-    const radius = 4;
-    const chunks = [];
-    for (let dx = -radius; dx <= radius; dx++) {
-      for (let dz = -radius; dz <= radius; dz++) {
-        const cx = X + dx;
-        const cz = Z + dz;
-        const key = this.getKey({ x: cx, z: cz });
-        const dist = dx * dx + dz * dz;
-        chunks.push({ x: cx, z: cz, key, dist });
-      }
-    }
-    chunks.sort((a, b) => a.dist - b.dist);
-    let added = 0;
-    for (const entry of chunks) {
-      if (gen.isGenerated(entry.key)) continue;
-      if (this.queuedChunks.has(entry.key)) continue;
-      this.queuedChunks.add(entry.key);
-      this.chunkQueue.push({ ...entry, retries: 0 });
-      added++;
-      if (added >= 6) break;
-    }
-    this._processQueue(gen);
-  }
-  _processQueue(gen) {
-    while (this.activeJobs < this.maxJobs && this.chunkQueue.length > 0) {
-      const entry = this.chunkQueue.shift();
-      this.queuedChunks.delete(entry.key);
-      if (gen.isGenerated(entry.key)) continue;
-      this.activeJobs++;
-      gen.buildChunk(entry.x, entry.z, entry.key).then((success) => {
-        if (!success && entry.retries < MAX_RETRIES) {
-          system36.runTimeout(() => {
-            if (!gen.isGenerated(entry.key) && !this.queuedChunks.has(entry.key)) {
-              this.queuedChunks.add(entry.key);
-              this.chunkQueue.push({ ...entry, retries: entry.retries + 1 });
-            }
-          }, 20);
-        }
-      }).catch((e) => console.error(`[GaiaDim] Chunk error:`, e)).finally(() => {
-        this.activeJobs--;
-      });
-    }
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/index.ts
-import { world as world33, system as system39 } from "@minecraft/server";
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/session-manager.ts
-import { world as world32 } from "@minecraft/server";
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/generator.ts
-import { system as system37 } from "@minecraft/server";
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/gaia-layers.ts
-var BIOME_IDS = {
-  OCEAN: 0,
-  // mineral_reservoir
-  LAND: 1,
-  // generic land marker
-  // Common (5)
-  PINK_AGATE_FOREST: 2,
-  BLUE_AGATE_TAIGA: 3,
-  GREEN_AGATE_JUNGLE: 4,
-  CRYSTAL_PLAINS: 5,
-  FOSSIL_WOODLAND: 6,
-  // Uncommon (6)
-  VOLCANIC_LANDS: 7,
-  STATIC_WASTELAND: 8,
-  SALT_DUNES: 9,
-  SMOLDERING_BOG: 10,
-  SHINING_GROVE: 11,
-  MOOKAITE_MESA: 12,
-  // Rare (3)
-  PURPLE_AGATE_SWAMP: 13,
-  GOLDSTONE_LANDS: 14,
-  MUTANT_WILDWOOD: 15,
-  // Gold (5)
-  GOLDEN_FOREST: 16,
-  GOLDEN_PLAINS: 17,
-  GOLDEN_HILLS: 18,
-  GOLDEN_SANDS: 19,
-  GOLDEN_MARSH: 20,
-  // Water
-  MINERAL_RIVER: 21,
-  // Gold marker
-  GOLD_ISLAND: 22
-};
-var B = BIOME_IDS;
-var COMMON = [B.PINK_AGATE_FOREST, B.BLUE_AGATE_TAIGA, B.GREEN_AGATE_JUNGLE, B.CRYSTAL_PLAINS, B.FOSSIL_WOODLAND];
-var UNCOMMON = [B.VOLCANIC_LANDS, B.STATIC_WASTELAND, B.SALT_DUNES, B.SMOLDERING_BOG, B.SHINING_GROVE, B.MOOKAITE_MESA];
-var RARE = [B.PURPLE_AGATE_SWAMP, B.GOLDSTONE_LANDS, B.MUTANT_WILDWOOD];
-var GOLD = [B.GOLDEN_SANDS, B.GOLDEN_MARSH, B.GOLDEN_HILLS, B.GOLDEN_FOREST, B.GOLDEN_PLAINS];
-var LayerRNG = class {
-  state;
-  constructor(seed2) {
-    this.state = seed2 | 0;
-  }
-  initRandom(x, z) {
-    let s = this.state;
-    s = Math.imul(s, s * 6364136223846793e3 + 1442695040888963300 | 0);
-    s = s + x | 0;
-    s = Math.imul(s, s * 6364136223846793e3 + 1442695040888963300 | 0);
-    s = s + z | 0;
-    s = Math.imul(s, s * 6364136223846793e3 + 1442695040888963300 | 0);
-    s = s + x | 0;
-    s = Math.imul(s, s * 6364136223846793e3 + 1442695040888963300 | 0);
-    s = s + z | 0;
-    this.state = s;
-  }
-  nextRandom(bound) {
-    let r = (this.state >> 24) % bound | 0;
-    if (r < 0) r += bound;
-    this.state = Math.imul(this.state, 6364136223846793e3) + 1442695040888963300 | 0;
-    return r;
-  }
-  random2(a, b) {
-    return this.nextRandom(2) === 0 ? a : b;
-  }
-  random4(a, b, c, d) {
-    const r = this.nextRandom(4);
-    return r === 0 ? a : r === 1 ? b : r === 2 ? c : d;
-  }
-};
-function cachedLayer(fn, cacheSize = 1024) {
-  const cache = /* @__PURE__ */ new Map();
-  return (x, z) => {
-    const key = (x & 65535) << 16 | z & 65535;
-    const v = cache.get(key);
-    if (v !== void 0) return v;
-    const res = fn(x, z);
-    if (cache.size > cacheSize) cache.clear();
-    cache.set(key, res);
-    return res;
-  };
-}
-function islandLayer(seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    rng.initRandom(x, z);
-    if (x === 0 && z === 0) return B.LAND;
-    return rng.nextRandom(10) === 0 ? B.LAND : B.OCEAN;
-  });
-}
-function zoomLayer(parent, seed2, fuzzy) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const px = x >> 1, pz = z >> 1;
-    const first = parent(px, pz);
-    rng.initRandom(px << 1, pz << 1);
-    const rx = x & 1, rz = z & 1;
-    if (rx === 0 && rz === 0) return first;
-    const south = parent(px, pz + 1);
-    const randFS = rng.random2(first, south);
-    if (rx === 0) return randFS;
-    const east = parent(px + 1, pz);
-    const randFE = rng.random2(first, east);
-    if (rz === 0) return randFE;
-    const se = parent(px + 1, pz + 1);
-    if (fuzzy) return rng.random4(first, south, east, se);
-    return modeOrRandom(rng, first, south, east, se);
-  });
-}
-function modeOrRandom(rng, a, b, c, d) {
-  if (b === c && c === d) return b;
-  if (a === b && a === c) return a;
-  if (a === b && a === d) return a;
-  if (a === c && a === d) return a;
-  if (a === b && c !== d) return a;
-  if (a === c && b !== d) return a;
-  if (a === d && b !== c) return a;
-  if (b === c && a !== d) return b;
-  if (b === d && a !== c) return b;
-  if (c === d && a !== b) return c;
-  return rng.random4(a, b, c, d);
-}
-function isOcean(v) {
-  return v === B.OCEAN;
-}
-function isGold(v) {
-  return v === B.GOLD_ISLAND || GOLD.includes(v);
-}
-function addIslandLayer(parent, seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const sw = parent(x - 1, z - 1);
-    const se = parent(x + 1, z - 1);
-    const ne = parent(x + 1, z + 1);
-    const nw = parent(x - 1, z + 1);
-    const center = parent(x, z);
-    rng.initRandom(x, z);
-    if (!isOcean(center) || isOcean(nw) && isOcean(ne) && isOcean(sw) && isOcean(se)) {
-      if (!isOcean(center) && (isOcean(nw) || isOcean(sw) || isOcean(ne) || isOcean(se)) && rng.nextRandom(5) === 0) {
-        if (isOcean(nw)) return center === B.LAND ? B.LAND : nw;
-        if (isOcean(sw)) return center === B.LAND ? B.LAND : sw;
-        if (isOcean(ne)) return center === B.LAND ? B.LAND : ne;
-        if (isOcean(se)) return center === B.LAND ? B.LAND : se;
-      }
-      return center;
-    } else {
-      let i = 1, j = B.LAND;
-      if (!isOcean(nw) && rng.nextRandom(i++) === 0) j = nw;
-      if (!isOcean(ne) && rng.nextRandom(i++) === 0) j = ne;
-      if (!isOcean(sw) && rng.nextRandom(i++) === 0) j = sw;
-      if (!isOcean(se) && rng.nextRandom(i++) === 0) j = se;
-      return rng.nextRandom(3) === 0 ? j : j === B.LAND ? B.LAND : center;
-    }
-  });
-}
-function removeTooMuchOcean(parent, seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const n = parent(x, z - 1), e = parent(x + 1, z);
-    const s = parent(x, z + 1), w = parent(x - 1, z);
-    const c = parent(x, z);
-    rng.initRandom(x, z);
-    if (isOcean(c) && isOcean(n) && isOcean(e) && isOcean(w) && isOcean(s)) {
-      return rng.nextRandom(2) === 0 ? c : B.LAND;
-    }
-    return B.LAND;
-  });
-}
-function goldIslandLayer(parent, seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const sw = parent(x - 1, z - 1), se = parent(x + 1, z - 1);
-    const ne = parent(x + 1, z + 1), nw = parent(x - 1, z + 1);
-    const c = parent(x, z);
-    rng.initRandom(x, z);
-    if (isOcean(sw) && isOcean(se) && isOcean(ne) && isOcean(nw) && isOcean(c)) {
-      if (rng.nextRandom(3) === 0) return B.GOLD_ISLAND;
-    }
-    return c;
-  });
-}
-function gaiaBiomesLayer(parent, seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const c = parent(x, z);
-    rng.initRandom(x, z);
-    if (isOcean(c)) return c;
-    if (isGold(c)) return GOLD[rng.nextRandom(GOLD.length)];
-    if (rng.nextRandom(16) === 0) return RARE[rng.nextRandom(RARE.length)];
-    if (rng.nextRandom(8) === 0) return UNCOMMON[rng.nextRandom(UNCOMMON.length)];
-    return COMMON[rng.nextRandom(COMMON.length)];
-  });
-}
-function smoothLayer(parent, seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const c = parent(x, z);
-    const n = parent(x, z - 1), e = parent(x + 1, z);
-    const s = parent(x, z + 1), w = parent(x - 1, z);
-    rng.initRandom(x, z);
-    if (n === s && w === e) return rng.nextRandom(2) === 0 ? n : w;
-    if (n === s) return n;
-    if (w === e) return w;
-    return c;
-  });
-}
-function riverLayer(parent, seed2) {
-  const rng = new LayerRNG(seed2);
-  return cachedLayer((x, z) => {
-    const c = parent(x, z);
-    const n = parent(x, z - 1), e = parent(x + 1, z);
-    const s = parent(x, z + 1), w = parent(x - 1, z);
-    if (c !== n || c !== e || c !== s || c !== w) return B.MINERAL_RIVER;
-    return B.OCEAN;
-  });
-}
-function riverMixLayer(biomesParent, riverParent, seed2) {
-  return cachedLayer((x, z) => {
-    const biome = biomesParent(x, z);
-    const river = riverParent(x, z);
-    if (isOcean(biome)) return biome;
-    if (river === B.MINERAL_RIVER) return B.MINERAL_RIVER;
-    return biome;
-  });
-}
-function oceanMixLayer(biomesParent, oceanParent, seed2) {
-  return cachedLayer((x, z) => {
-    const biome = biomesParent(x, z);
-    if (!isOcean(biome)) return biome;
-    return B.OCEAN;
-  });
-}
-function buildGaiaLayers(worldSeed) {
-  let islands = islandLayer(worldSeed + 1);
-  islands = zoomLayer(islands, worldSeed + 2e3, true);
-  islands = addIslandLayer(islands, worldSeed + 1);
-  islands = zoomLayer(islands, worldSeed + 2001, false);
-  islands = addIslandLayer(islands, worldSeed + 2);
-  islands = addIslandLayer(islands, worldSeed + 50);
-  islands = addIslandLayer(islands, worldSeed + 70);
-  islands = removeTooMuchOcean(islands, worldSeed + 2);
-  let ocean = islandLayer(worldSeed + 2);
-  ocean = cachedLayer((_x, _z) => B.OCEAN);
-  ocean = zoomLayer(ocean, worldSeed + 2001, true);
-  for (let i = 2002; i <= 2005; i++) ocean = zoomLayer(ocean, worldSeed + i, false);
-  ocean = smoothLayer(ocean, worldSeed + 1003);
-  islands = addIslandLayer(islands, worldSeed + 3);
-  islands = zoomLayer(islands, worldSeed + 2002, false);
-  islands = zoomLayer(islands, worldSeed + 2003, false);
-  islands = addIslandLayer(islands, worldSeed + 4);
-  islands = goldIslandLayer(islands, worldSeed + 5);
-  islands = zoomLayer(islands, worldSeed + 1e3, false);
-  let biomes = gaiaBiomesLayer(islands, worldSeed + 1);
-  for (let i = 1e3; i <= 1005; i++) biomes = zoomLayer(biomes, worldSeed + i, false);
-  let river = riverLayer(biomes, worldSeed + 1);
-  river = smoothLayer(river, worldSeed + 1e3);
-  biomes = smoothLayer(biomes, worldSeed + 1e3);
-  biomes = riverMixLayer(biomes, river, worldSeed + 100);
-  biomes = oceanMixLayer(biomes, ocean, worldSeed + 100);
-  return biomes;
-}
-var ID_TO_NAME = {
-  [B.OCEAN]: "gaiadimension:crystal_plains",
-  [B.PINK_AGATE_FOREST]: "gaiadimension:pink_agate_forest",
-  [B.BLUE_AGATE_TAIGA]: "gaiadimension:blue_agate_taiga",
-  [B.GREEN_AGATE_JUNGLE]: "gaiadimension:green_agate_jungle",
-  [B.CRYSTAL_PLAINS]: "gaiadimension:crystal_plains",
-  [B.FOSSIL_WOODLAND]: "gaiadimension:fossil_woodland",
-  [B.VOLCANIC_LANDS]: "gaiadimension:volcanic_lands",
-  [B.STATIC_WASTELAND]: "gaiadimension:static_wasteland",
-  [B.SALT_DUNES]: "gaiadimension:salt_dunes",
-  [B.SMOLDERING_BOG]: "gaiadimension:smoldering_bog",
-  [B.SHINING_GROVE]: "gaiadimension:shining_grove",
-  [B.MOOKAITE_MESA]: "gaiadimension:mookaite_mesa",
-  [B.PURPLE_AGATE_SWAMP]: "gaiadimension:purple_agate_swamp",
-  [B.GOLDSTONE_LANDS]: "gaiadimension:goldstone_lands",
-  [B.MUTANT_WILDWOOD]: "gaiadimension:mutant_agate_wildwood",
-  [B.GOLDEN_FOREST]: "gaiadimension:golden_forest",
-  [B.GOLDEN_PLAINS]: "gaiadimension:golden_plains",
-  [B.GOLDEN_HILLS]: "gaiadimension:golden_hills",
-  [B.GOLDEN_SANDS]: "gaiadimension:golden_sands",
-  [B.GOLDEN_MARSH]: "gaiadimension:golden_marsh",
-  [B.MINERAL_RIVER]: "gaiadimension:mineral_river",
-  [B.GOLD_ISLAND]: "gaiadimension:golden_forest",
-  [B.LAND]: "gaiadimension:crystal_plains"
-};
-function getBiomeNameFromId(id) {
-  return ID_TO_NAME[id] ?? "gaiadimension:crystal_plains";
-}
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/definition-tree.ts
-import { ListBlockVolume as ListBlockVolume2 } from "@minecraft/server";
-var CompiledTreeSample = class {
-  lists;
-  constructor() {
-    this.lists = /* @__PURE__ */ new Map();
-  }
-  placePaleteLike() {
-    return this.lists.entries();
-  }
-  [Symbol.iterator]() {
-    return this.lists.entries();
-  }
-};
-var TreeDefinition = class {
-  id;
-  IsPrecalculated;
-  samples;
-  constructor(id) {
-    this.id = id;
-    this.IsPrecalculated = false;
-    this.samples = [];
-  }
-  place(location, seed2, placer) {
-    return this.build(location, seed2, placer);
-  }
-  onPrecalculate(samples, seed2) {
-    samples ??= 5;
-    this.IsPrecalculated = true;
-    while (samples-- > 0) {
-      const placer = new PalettedPlacer();
-      for (const _ of this.build({ x: 0, y: 0, z: 0 }, seed2, placer)) ;
-      const sample = new CompiledTreeSample();
-      for (const [p, list] of placer.palettes.entries()) {
-        const volume = new ListBlockVolume2(list);
-        const newList = [];
-        for (const a of volume.getBlockLocationIterator()) newList.push(a);
-        sample.lists.set(p, newList);
-      }
-      this.samples.push(sample);
-    }
-  }
-  getCompiledSample(r) {
-    return this.samples.random(r);
-  }
-  /** Used by the generator to validate placement */
-  canPlaceValidator = () => true;
-};
-var PillarTreeDefinition = class extends TreeDefinition {
-  height;
-  logPaletted;
-  constructor(id = "pillar") {
-    super(id);
-    this.height = [3, 10];
-    this.logPaletted = "minecraft:spruce_log";
-  }
-  setCanPlaceValidator(p) {
-    this.canPlaceValidator = p;
-    return this;
-  }
-  setLogPaletted(p) {
-    this.logPaletted = p;
-    return this;
-  }
-  setHeight(min, max) {
-    this.height[0] = min;
-    this.height[1] = max ?? min;
-    return this;
-  }
-  *build(location, seed2, placer) {
-    const { x, y, z } = location;
-    const h = seed2.nextFloat() * (this.height[1] - this.height[0]) + this.height[0];
-    for (let Y = 0; Y < h; Y++) {
-      placer.setBlock({ x: x + 0.5, y: y + Y, z: z + 0.5 }, this.logPaletted.toPermutation(seed2.nextFloat()));
-    }
-  }
-};
-var SpruceTreeDefinition = class extends PillarTreeDefinition {
-  offset;
-  leavesPaletted;
-  constructor() {
-    super("spruce");
-    this.offset = [1, 2];
-    this.leavesPaletted = "minecraft:spruce_leaves";
-  }
-  setLeavesPaletted(p) {
-    this.leavesPaletted = p;
-    return this;
-  }
-  setOffSet(min, max) {
-    this.offset[0] = min;
-    this.offset[1] = max ?? min;
-    return this;
-  }
-  *build(location, seed2, placer) {
-    const { x, y, z } = location;
-    const add = seed2.nextFloat() * (this.offset[1] - this.offset[0]) + this.offset[0];
-    const h = seed2.nextFloat() * (this.height[1] - this.height[0]) + this.height[0];
-    const height = h + add;
-    for (let Y = 0; Y < height; Y++) {
-      let max = height - Y + 1;
-      if (Y < height - 1) placer.setBlock({ x, y: y + Y, z }, this.logPaletted.toPermutation(seed2.nextFloat()));
-      else placer.setBlock({ x: x + 0.5, y: y + Y, z: z + 0.5 }, this.leavesPaletted.toPermutation(seed2.nextFloat()));
-      if (Y >= add) for (let i = 0.5; i < max; i += 0.8) {
-        let count = i * Math.PI;
-        for (let j = 0; j < count; j++) {
-          const distance = seed2.nextFloat() * i / 3 + 0.2;
-          const rot = seed2.nextFloat() * Math.PI * 2;
-          placer.setBlock({
-            x: x + Math.sin(rot) * distance + 0.5,
-            y: y + Y,
-            z: z + Math.cos(rot) * distance + 0.5
-          }, this.leavesPaletted.toPermutation(seed2.nextFloat()));
-        }
-        yield;
-      }
-    }
-  }
-};
-var TreePalette = class {
-  trees;
-  constructor() {
-    this.trees = [];
-  }
-  add(treeDefinition, num) {
-    let value = num ?? 1;
-    while (value--) this.trees.push(treeDefinition);
-    return this;
-  }
-  get(random) {
-    return this.trees.random(random);
-  }
-  onPrecalculate(samples, seed2) {
-    for (const tree of this.trees) if (!tree.IsPrecalculated) tree.onPrecalculate(samples, seed2);
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/definition-biome.ts
-var BiomeDefinition = class {
-  id;
-  trees;
-  /** @deprecated Use treesPerChunk instead */
-  treesChance;
-  /** @deprecated Use treesPerChunk instead */
-  treeAreaChance;
-  /** Java countExtra: base tree count per chunk */
-  treesPerChunk;
-  /** Java countExtra: chance of extra trees (0.0 - 1.0) */
-  treesExtraChance;
-  /** Java countExtra: number of extra trees when chance succeeds */
-  treesExtra;
-  temperature;
-  humidity;
-  groundPaletted;
-  underGroundPaletted;
-  vegetationPalette;
-  vegetationChance;
-  vegetationValidation;
-  IsPrecalculated;
-  depth;
-  scale;
-  features;
-  constructor(id) {
-    this.id = id;
-    this.trees = new TreePalette();
-    this.treesChance = 0.02;
-    this.treeAreaChance = 0.5;
-    this.treesPerChunk = 0;
-    this.treesExtraChance = 0.1;
-    this.treesExtra = 1;
-    this.temperature = [0, 1];
-    this.humidity = [0, 1];
-    this.groundPaletted = new PalettedBrush();
-    this.underGroundPaletted = new PalettedBrush();
-    this.vegetationPalette = new PalettedBrush();
-    this.vegetationChance = 0.1;
-    this.vegetationValidation = true;
-    this.IsPrecalculated = false;
-    this.depth = 0.125;
-    this.scale = 0.05;
-    this.features = [];
-  }
-  setDepth(p) {
-    this.depth = p;
-    return this;
-  }
-  setScale(p) {
-    this.scale = p;
-    return this;
-  }
-  onPrecalculate(samples, seed2) {
-    this.trees.onPrecalculate(samples, seed2);
-    this.IsPrecalculated = true;
-  }
-  /**@default 0.02 @deprecated Use setTreesPerChunk instead */
-  setTreesChance(p) {
-    this.treesChance = p;
-    return this;
-  }
-  /**@default 0.5 @deprecated Use setTreesPerChunk instead */
-  setTreesAreaChance(p) {
-    this.treeAreaChance = p;
-    return this;
-  }
-  /**
-   * Java-parity tree placement: countExtra(count, chance, extra)
-   * Places `count` trees per chunk, with `chance` probability of placing `extra` more.
-   */
-  setTreesPerChunk(count, chance = 0.1, extra = 1) {
-    this.treesPerChunk = count;
-    this.treesExtraChance = chance;
-    this.treesExtra = extra;
-    return this;
-  }
-  addFeature(feature) {
-    this.features.push(feature);
-    return this;
-  }
-  setTrees(p) {
-    this.trees = p;
-    return this;
-  }
-  setTemperature(min, max) {
-    this.temperature = [min, max];
-    return this;
-  }
-  setHumidity(min, max) {
-    this.humidity = [min, max];
-    return this;
-  }
-  setGroundPalette(p) {
-    this.groundPaletted = p;
-    return this;
-  }
-  setUnderGroundPalette(p) {
-    this.underGroundPaletted = p;
-    return this;
-  }
-  setVegetationPalette(p) {
-    this.vegetationPalette = p;
-    return this;
-  }
-  /**@default true @deprecated */
-  setVegetationValidation(p) {
-    this.vegetationValidation = p;
-    return this;
-  }
-  /**@default 0.1 */
-  setVegetationChance(p) {
-    this.vegetationChance = p;
-    return this;
-  }
-  get hasTrees() {
-    return this.trees.trees.length;
-  }
-  getTreeDefinition(random) {
-    return this.trees.get(random.nextFloat());
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/structures.ts
-import { world as world30, StructureRotation, StructureMirrorAxis, StructureAnimationMode } from "@minecraft/server";
-var MINI_TOWER_TYPES = ["amethyst_tower", "copal_tower", "jade_tower", "jet_tower"];
-var MINI_TOWER_BIOMES = /* @__PURE__ */ new Set([
-  "gaiadimension:pink_agate_forest",
-  "gaiadimension:blue_agate_taiga",
-  "gaiadimension:green_agate_jungle",
-  "gaiadimension:purple_agate_swamp",
-  "gaiadimension:mutant_agate_wildwood",
-  "gaiadimension:fossil_woodland",
-  "gaiadimension:crystal_plains"
-]);
-var MALACHITE_BIOMES = /* @__PURE__ */ new Set([
-  "gaiadimension:pink_agate_forest",
-  "gaiadimension:green_agate_jungle",
-  "gaiadimension:crystal_plains"
-]);
-function getStructureChunkInRegion(chunkX, chunkZ, spacing, separation, salt, worldSeed, triangular) {
-  const regionX = Math.floor(chunkX / spacing);
-  const regionZ = Math.floor(chunkZ / spacing);
-  const rngSeed = hashSeed(regionX, regionZ, worldSeed, salt);
-  const rng = new SimpleRNG(rngSeed);
-  const range = spacing - separation;
-  let offsetX, offsetZ;
-  if (triangular) {
-    offsetX = Math.floor((rng.nextInt(range) + rng.nextInt(range)) / 2);
-    offsetZ = Math.floor((rng.nextInt(range) + rng.nextInt(range)) / 2);
-  } else {
-    offsetX = rng.nextInt(range);
-    offsetZ = rng.nextInt(range);
-  }
-  const structChunkX = regionX * spacing + offsetX;
-  const structChunkZ = regionZ * spacing + offsetZ;
-  if (chunkX === structChunkX && chunkZ === structChunkZ) {
-    return { cx: structChunkX, cz: structChunkZ };
-  }
-  return null;
-}
-function hashSeed(regionX, regionZ, worldSeed, salt) {
-  let hash = regionX * 341873 + regionZ * 132897 + worldSeed + salt;
-  hash = (hash >>> 16 ^ hash) * 73244475;
-  hash = (hash >>> 16 ^ hash) * 73244475;
-  hash = hash >>> 16 ^ hash;
-  return Math.abs(hash);
-}
-var SimpleRNG = class {
-  state;
-  constructor(seed2) {
-    this.state = (seed2 ^ 25214903917) & 4294967295;
-  }
-  next() {
-    this.state = this.state * 1103515245 + 12345 & 2147483647;
-    return this.state;
-  }
-  nextInt(bound) {
-    if (bound <= 0) return 0;
-    return this.next() % bound;
-  }
-  nextFloat() {
-    return this.next() / 2147483647;
-  }
-};
-var ROTATIONS = [
-  StructureRotation.None,
-  StructureRotation.Rotate90,
-  StructureRotation.Rotate180,
-  StructureRotation.Rotate270
-];
-var PLACED_STRUCTURES = /* @__PURE__ */ new Set();
-function getPlacementKey(chunkX, chunkZ, type2) {
-  return `struct:${type2}:${chunkX},${chunkZ}`;
-}
-function placeStructuresForChunk(chunkX, chunkZ, dimension, worldSeed, getBiomeAt, getTerrainHeightAt) {
-  const miniKey = getPlacementKey(chunkX, chunkZ, "mini_tower");
-  if (!PLACED_STRUCTURES.has(miniKey)) {
-    const miniResult = getStructureChunkInRegion(chunkX, chunkZ, 30, 10, 420, worldSeed, false);
-    if (miniResult) {
-      const worldX = miniResult.cx * 16 + 8;
-      const worldZ = miniResult.cz * 16 + 8;
-      const biome = getBiomeAt(worldX, worldZ);
-      if (MINI_TOWER_BIOMES.has(biome.id)) {
-        const typeRng = new SimpleRNG(hashSeed(miniResult.cx, miniResult.cz, worldSeed, 999));
-        const towerIdx = typeRng.nextInt(MINI_TOWER_TYPES.length);
-        const towerName = MINI_TOWER_TYPES[towerIdx];
-        const rotation = ROTATIONS[typeRng.nextInt(4)];
-        const surfaceY = getTerrainHeightAt(worldX, worldZ);
-        placeMiniTower(dimension, worldX, surfaceY, worldZ, towerName, rotation);
-        PLACED_STRUCTURES.add(miniKey);
-      }
-    }
-  }
-  const malKey = getPlacementKey(chunkX, chunkZ, "malachite_watchtower");
-  if (!PLACED_STRUCTURES.has(malKey)) {
-    const malResult = getStructureChunkInRegion(chunkX, chunkZ, 35, 15, 621, worldSeed, true);
-    if (malResult) {
-      const worldX = malResult.cx * 16 + 8;
-      const worldZ = malResult.cz * 16 + 8;
-      const biome = getBiomeAt(worldX, worldZ);
-      if (MALACHITE_BIOMES.has(biome.id)) {
-        const typeRng = new SimpleRNG(hashSeed(malResult.cx, malResult.cz, worldSeed, 1337));
-        const rotation = ROTATIONS[typeRng.nextInt(4)];
-        const surfaceY = getTerrainHeightAt(worldX, worldZ);
-        placeMalachiteTower(dimension, worldX, surfaceY, worldZ, rotation);
-        PLACED_STRUCTURES.add(malKey);
-      }
-    }
-  }
-}
-function placeMiniTower(dimension, x, surfaceY, z, towerName, rotation) {
-  try {
-    const structureId = `mystructure:${towerName}`;
-    const placeY = Math.floor(surfaceY);
-    const options = {
-      rotation,
-      mirror: StructureMirrorAxis.None,
-      animationMode: StructureAnimationMode.None,
-      includeEntities: true,
-      includeBlocks: true,
-      waterlogged: false
-    };
-    world30.structureManager.place(structureId, dimension, { x, y: placeY, z }, options);
-    fillSupportColumn(dimension, x, placeY, z, 17);
-  } catch (e) {
-    console.warn(`[GaiaDim] Failed to place ${towerName} at ${x},${surfaceY},${z}:`, e);
-  }
-}
-function placeMalachiteTower(dimension, x, surfaceY, z, rotation) {
-  try {
-    const structureId = "mystructure:malachite_tower";
-    const placeY = Math.floor(surfaceY);
-    const options = {
-      rotation,
-      mirror: StructureMirrorAxis.None,
-      animationMode: StructureAnimationMode.None,
-      includeEntities: true,
-      includeBlocks: true,
-      waterlogged: false
-    };
-    world30.structureManager.place(structureId, dimension, { x, y: placeY, z }, options);
-    fillSupportColumn(dimension, x, placeY, z, 25);
-  } catch (e) {
-    console.warn(`[GaiaDim] Failed to place malachite_tower at ${x},${surfaceY},${z}:`, e);
-  }
-}
-function fillSupportColumn(dimension, centerX, baseY, centerZ, width) {
-  const half = Math.floor(width / 2);
-  const step = 4;
-  for (let dx = -half; dx <= half; dx += step) {
-    for (let dz = -half; dz <= half; dz += step) {
-      const bx = centerX + dx;
-      const bz = centerZ + dz;
-      for (let y = baseY - 1; y > baseY - 15; y--) {
-        try {
-          const block = dimension.getBlock({ x: bx, y, z: bz });
-          if (!block) break;
-          if (block.typeId !== "minecraft:air" && !block.isLiquid) break;
-          block.setType("gaiadimension:heavy_soil");
-        } catch (_) {
-          break;
-        }
-      }
-    }
-  }
-}
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/generator.ts
-var SEA_LEVEL = 63;
-var ENTRY = 0;
-var STONE_DEPTH = 10;
-var SOIL_DEPTH = 4;
-function setBlock(block, type2) {
-  if (!block) return false;
-  if (block.typeId !== type2) {
-    try {
-      block.setType(type2);
-    } catch (_) {
-      return false;
-    }
-  }
-  return true;
-}
-var ChunkGenerator = class _ChunkGenerator {
-  seaLevel = SEA_LEVEL;
-  entry = ENTRY;
-  manager;
-  dimension;
-  dimensionId;
-  range;
-  seed;
-  isGenerating = /* @__PURE__ */ new Set();
-  // Java Edition 5x5 Parabolic Biome Weight Matrix
-  static biomeWeights = [];
-  static {
-    for (let rx = -2; rx <= 2; ++rx) {
-      for (let rz = -2; rz <= 2; ++rz) {
-        const weight = 10 / Math.sqrt(rx * rx + rz * rz + 0.2);
-        _ChunkGenerator.biomeWeights[rx + 2 + (rz + 2) * 5] = weight;
-      }
-    }
-  }
-  // Noise layers for terrain shape
-  base;
-  spikes;
-  kind;
-  overall;
-  deep;
-  trees;
-  // Layer-based biome lookup (ported from Java)
-  layerFn;
-  // Biome cache: biome name -> BiomeDefinition
-  biomeCache = /* @__PURE__ */ new Map();
-  constructor(sessionManager, dimension, seed2) {
-    this.manager = sessionManager;
-    this.dimension = dimension;
-    this.dimensionId = dimension.id;
-    this.range = dimension.heightRange;
-    this.seed = seed2;
-    this.layerFn = buildGaiaLayers(seed2.seed);
-    this.base = new FastNoiseLite(seed2.nextInt());
-    this.base.SetNoiseType(FastNoiseLite.NoiseType.Perlin);
-    this.base.SetFractalType(FastNoiseLite.FractalType.FBm);
-    this.base.SetFractalOctaves(2);
-    this.base.SetFrequency(0.01);
-    this.spikes = new FastNoiseLite(seed2.nextInt());
-    this.spikes.SetNoiseType(FastNoiseLite.NoiseType.Cellular);
-    this.spikes.SetCellularJitter(1.2);
-    this.spikes.SetFrequency(0.02);
-    this.kind = new FastNoiseLite(seed2.nextInt());
-    this.kind.SetFrequency(8e-4);
-    this.overall = new FastNoiseLite(seed2.nextInt());
-    this.overall.SetFrequency(0.02);
-    this.deep = new FastNoiseLite(seed2.nextInt());
-    this.deep.SetFrequency(4e-4);
-    this.trees = new FastNoiseLite(seed2.nextInt());
-    this.trees.SetFrequency(3e-3);
-  }
-  /**
-   * Get the biome at a world (block) coordinate using the Java layer system.
-   * The layers operate on biome-grid coords (Ã·4), matching Java's getNoiseBiome(x/4, y, z/4).
-   */
-  getBiomeAt(x, z) {
-    const bx = x >> 2, bz = z >> 2;
-    const biomeId = this.layerFn(bx, bz);
-    const name = getBiomeNameFromId(biomeId);
-    let cached = this.biomeCache.get(name);
-    if (cached) return cached;
-    const bm2 = this.manager.definition?.biomeManager;
-    if (bm2) {
-      cached = bm2.biomes.find((b) => b.id === name);
-      if (cached) {
-        this.biomeCache.set(name, cached);
-        return cached;
-      }
-    }
-    return bm2?.default ?? new BiomeDefinition(name);
-  }
-  getTerrainHeight(x, z) {
-    const { base, spikes, kind, overall, deep } = this;
-    const s = spikes.GetNoise(x, z) * 0.7 + 1;
-    const b = base.GetNoise(x, z) + 1;
-    const k = kind.GetNoise(x, z) / 2;
-    const o = (overall.GetNoise(x, z) + 1) / 2;
-    const d = (deep.GetNoise(x, z) + 1) / 2;
-    const waterProp = Math.max(0, Math.min(1, d * 5));
-    const height = (s * 2.5 * (0.8 + k) + b * Math.max(0, 0.5 + k) * 8 + o * (0.8 + k)) * (waterProp / 2 + 0.5) + waterProp * 3.5;
-    return height;
-  }
-  /**
-   * 1:1 Java port of GaiaTerrainWarp.fillNoiseColumn lines 61-86.
-   * Computes the low-frequency biome depth and scale blending.
-   * This is sampled at 4-block cell corners and bilinearly interpolated
-   * across the chunk to create smooth slopes at biome boundaries.
-   */
-  getBiomeBlend(x, z) {
-    const centerBiome = this.getBiomeAt(x, z);
-    const centerDepth = centerBiome.depth;
-    let scaleSum = 0;
-    let depthSum = 0;
-    let weightSum = 0;
-    for (let rx = -2; rx <= 2; rx++) {
-      for (let rz = -2; rz <= 2; rz++) {
-        const b = this.getBiomeAt(x + rx * 4, z + rz * 4);
-        const offD = b.depth;
-        const offS = b.scale;
-        const depthPenalty = offD > centerDepth ? 0.5 : 1;
-        const w = depthPenalty * _ChunkGenerator.biomeWeights[rx + 2 + (rz + 2) * 5] / (offD + 2);
-        scaleSum += offS * w;
-        depthSum += offD * w;
-        weightSum += w;
-      }
-    }
-    const avgDepth = depthSum / weightSum;
-    const avgScale = scaleSum / weightSum;
-    const depthOffset = (avgDepth * 0.5 - 0.125) * 0.265625;
-    const scaleFactor = 96 / (avgScale * 0.9 + 0.1);
-    return { depthOffset, scaleFactor, avgScale };
-  }
-  buildChunk(X, Z, hash) {
-    if (this.isGenerating.has(hash)) return Promise.resolve(true);
-    if (this.isGenerated(hash)) return Promise.resolve(true);
-    this.isGenerating.add(hash);
-    return new Promise((resolve) => {
-      const failRef = { count: 0 };
-      system37.runJob(this.generate(X, Z, failRef, () => {
-        this.isGenerating.delete(hash);
-        if (failRef.count === 0) {
-          this.setGenerated(hash);
-          try {
-            placeStructuresForChunk(
-              X,
-              Z,
-              this.dimension,
-              this.seed.seed,
-              (x, z) => this.getBiomeAt(x, z),
-              (x, z) => {
-                const raw = this.getTerrainHeight(x, z);
-                const blend = this.getBiomeBlend(x, z);
-                return Math.floor(68 + 128 * blend.depthOffset + 128 * (raw * 10) / blend.scaleFactor);
-              }
-            );
-          } catch (e) {
-            console.warn(`[GaiaDim] Structure placement error in chunk ${X},${Z}:`, e);
-          }
-          resolve(true);
-        } else {
-          resolve(false);
-        }
-      }));
-    });
-  }
-  isGenerated(hash) {
-    return this.manager.isGenerated(hash + this.dimensionId);
-  }
-  setGenerated(hash) {
-    this.manager.setGenerated(hash + this.dimensionId);
-  }
-  /**
-   * Single-pass chunk generator: stone -> soil -> surface grass -> vegetation -> trees.
-   * Yields every X-row to prevent watchdog timeout.
-   */
-  *generate(X, Z, failRef, done) {
-    const { dimension: dim } = this;
-    const random = this.seed.getSeqence(X, Z);
-    const worldX = X * 16, worldZ = Z * 16;
-    const placedTrees = [];
-    const terrainMap = new Array(256);
-    const biomeMap = new Array(256);
-    const underwaterMap = new Array(256);
-    try {
-      const CELL = 4;
-      const CELLS_X = 16 / CELL;
-      const CELLS_Z = 16 / CELL;
-      const corners = [];
-      for (let cx = 0; cx <= CELLS_X; cx++) {
-        corners[cx] = [];
-        for (let cz = 0; cz <= CELLS_Z; cz++) {
-          corners[cx][cz] = this.getBiomeBlend(worldX + cx * CELL, worldZ + cz * CELL);
-        }
-      }
-      for (let x = 0; x < 16; x++) {
-        for (let z = 0; z < 16; z++) {
-          const xx = worldX + x, zz = worldZ + z;
-          const jitterX = Math.round(this.spikes.GetNoise(xx * 2, zz * 2) * 5);
-          const jitterZ = Math.round(this.spikes.GetNoise(xx * 2 + 1e3, zz * 2 + 1e3) * 5);
-          const biome = this.getBiomeAt(xx + jitterX, zz + jitterZ);
-          const cellX = Math.floor(x / CELL);
-          const cellZ = Math.floor(z / CELL);
-          const fracX = (x - cellX * CELL) / CELL;
-          const fracZ = (z - cellZ * CELL) / CELL;
-          const c00 = corners[cellX][cellZ];
-          const c10 = corners[cellX + 1][cellZ];
-          const c01 = corners[cellX][cellZ + 1];
-          const c11 = corners[cellX + 1][cellZ + 1];
-          const depthOffset = c00.depthOffset + (c10.depthOffset - c00.depthOffset) * fracX + (c01.depthOffset - c00.depthOffset) * fracZ + (c00.depthOffset - c10.depthOffset - c01.depthOffset + c11.depthOffset) * fracX * fracZ;
-          const scaleFactor = c00.scaleFactor + (c10.scaleFactor - c00.scaleFactor) * fracX + (c01.scaleFactor - c00.scaleFactor) * fracZ + (c00.scaleFactor - c10.scaleFactor - c01.scaleFactor + c11.scaleFactor) * fracX * fracZ;
-          const avgScale = c00.avgScale + (c10.avgScale - c00.avgScale) * fracX + (c01.avgScale - c00.avgScale) * fracZ + (c00.avgScale - c10.avgScale - c01.avgScale + c11.avgScale) * fracX * fracZ;
-          const raw = this.getTerrainHeight(xx, zz);
-          let terrain = Math.floor(68 + 128 * depthOffset + 128 * (raw * 10) / scaleFactor);
-          if (isNaN(terrain) || !isFinite(terrain)) terrain = ENTRY;
-          terrain = Math.max(this.range.min, Math.min(this.range.max - 1, terrain));
-          const groundId = biome.groundPaletted?.permutations?.[0] ?? "gaiadimension:crystal_plains_glitter_grass";
-          const underId = biome.underGroundPaletted?.permutations?.[0] ?? "gaiadimension:heavy_soil";
-          const isUnderwater = terrain < SEA_LEVEL;
-          const stoneStart = Math.max(this.range.min, terrain - (STONE_DEPTH + SOIL_DEPTH));
-          for (let y = stoneStart; y < terrain - SOIL_DEPTH; y++) {
-            if (!setBlock(dim.getBlock({ x: xx, y, z: zz }), "gaiadimension:gaia_stone")) failRef.count++;
-          }
-          for (let y = terrain - SOIL_DEPTH; y < terrain; y++) {
-            if (!setBlock(dim.getBlock({ x: xx, y, z: zz }), underId)) failRef.count++;
-          }
-          try {
-            const surfaceBlock = dim.getBlock({ x: xx, y: terrain, z: zz });
-            if (surfaceBlock) {
-              if (isUnderwater && groundId.includes("grass")) surfaceBlock.setType(underId);
-              else surfaceBlock.setType(groundId);
-            }
-          } catch (_) {
-          }
-          if (isUnderwater) {
-            for (let y = terrain + 1; y <= SEA_LEVEL; y++) {
-              const waterBlock = dim.getBlock({ x: xx, y, z: zz });
-              if (waterBlock) {
-                try {
-                  waterBlock.setType("gaiadimension:mineral_water");
-                } catch (_) {
-                }
-              }
-            }
-          }
-          if (!isUnderwater && (biome.vegetationPalette?.permutations?.length ?? 0) > 0) {
-            if (random.nextFloat() < biome.vegetationChance) {
-              const idx = Math.floor(random.nextFloat() * biome.vegetationPalette.permutations.length);
-              const vegId = biome.vegetationPalette.permutations[idx];
-              if (vegId) {
-                const vBlock = dim.getBlock({ x: xx, y: terrain + 1, z: zz });
-                if (vBlock && vBlock.typeId === "minecraft:air") {
-                  try {
-                    vBlock.setType(vegId);
-                  } catch (_) {
-                  }
-                }
-              }
-            }
-          }
-          terrainMap[x * 16 + z] = terrain;
-          biomeMap[x * 16 + z] = biome;
-          underwaterMap[x * 16 + z] = isUnderwater;
-        }
-        yield;
-      }
-      const centerBiome = biomeMap[8 * 16 + 8] || biomeMap[0];
-      if (centerBiome && centerBiome.features && centerBiome.features.length > 0) {
-        for (const feature of centerBiome.features) {
-          try {
-            feature.place(dim, random, worldX, worldZ, terrainMap, underwaterMap);
-          } catch (fErr) {
-            console.warn(`[GaiaDim] Feature place failed at chunk ${X},${Z}: ${fErr}`);
-          }
-        }
-      }
-      if (centerBiome && centerBiome.hasTrees && centerBiome.treesPerChunk >= 0) {
-        let totalTrees = centerBiome.treesPerChunk;
-        if (random.nextFloat() < centerBiome.treesExtraChance) {
-          totalTrees += centerBiome.treesExtra;
-        }
-        let placed = 0;
-        for (let t = 0; t < totalTrees; t++) {
-          const tx = Math.floor(random.nextFloat() * 16);
-          const tz = Math.floor(random.nextFloat() * 16);
-          const tIdx = tx * 16 + tz;
-          if (underwaterMap[tIdx]) continue;
-          const terrain = terrainMap[tIdx];
-          if (terrain === void 0) continue;
-          const txx = worldX + tx;
-          const tzz = worldZ + tz;
-          let tooClose = false;
-          for (const pt of placedTrees) {
-            if (Math.abs(pt.x - txx) < 3 && Math.abs(pt.z - tzz) < 3) {
-              tooClose = true;
-              break;
-            }
-          }
-          if (tooClose) continue;
-          const biome = biomeMap[tIdx] || centerBiome;
-          const treeDef = biome.trees.get(random.nextFloat());
-          if (treeDef) {
-            const above = dim.getBlock({ x: txx, y: terrain + 1, z: tzz });
-            if (above && above.typeId === "minecraft:air") {
-              try {
-                yield* this.placeTree(dim, txx, terrain + 1, tzz, treeDef, random);
-                placedTrees.push({ x: txx, z: tzz });
-                placed++;
-              } catch (treeErr) {
-                console.warn(`[GaiaDim] Tree place failed at ${txx},${terrain + 1},${tzz}: ${treeErr}`);
-              }
-            }
-          }
-        }
-      }
-      done();
-    } catch (e) {
-      console.error(`[GaiaDim] Chunk ${X},${Z} error:`, e);
-      done();
-    }
-  }
-  *placeTree(dim, x, baseY, z, treeDef, random) {
-    const logId = treeDef.logPaletted?.permutations?.[0];
-    const leafId = treeDef.leavesPaletted?.permutations?.[0] ?? treeDef.carpetPaletted?.permutations?.[0];
-    if (!logId) return;
-    const minH = treeDef.height?.[0] ?? 5;
-    const maxH = treeDef.height?.[1] ?? 11;
-    const h = minH + Math.floor(random.nextFloat() * (maxH - minH + 1));
-    const treeId = treeDef.id || "";
-    let attachments;
-    if (treeId === "green_agate") {
-      attachments = placeThickTrunk(dim, x, baseY, z, h, logId);
-    } else if (treeId === "purple_agate") {
-      attachments = placeCardinalTrunk(dim, x, baseY, z, h, logId);
-    } else if (treeId === "aura") {
-      attachments = placeFourBranchTrunk(dim, x, baseY, z, h, logId);
-    } else if (treeId === "golden_small" || treeId === "golden_big") {
-      attachments = placeVaryingFourBranchTrunk(dim, x, baseY, z, h, logId, random);
-    } else if (treeId === "green_agate_bush") {
-      setBlock(dim.getBlock({ x, y: baseY, z }), logId);
-      attachments = [{ x, y: baseY + 1, z }];
-    } else {
-      for (let i = 0; i < h; i++) {
-        setBlock(dim.getBlock({ x, y: baseY + i, z }), logId);
-      }
-      attachments = [{ x, y: baseY + h, z }];
-    }
-    if (!leafId) return;
-    for (const att of attachments) {
-      placeFoliageForTree(dim, att.x, att.y, att.z, treeId, leafId, random);
-    }
-    yield;
-  }
-};
-function placeThickTrunk(dim, x, baseY, z, h, logId) {
-  for (let y = 0; y < h; y++) {
-    const wy = baseY + y;
-    if (y === 0) {
-      setBlock(dim.getBlock({ x, y: wy, z: z - 2 }), logId);
-      setBlock(dim.getBlock({ x, y: wy, z: z + 2 }), logId);
-      setBlock(dim.getBlock({ x: x + 2, y: wy, z }), logId);
-      setBlock(dim.getBlock({ x: x - 2, y: wy, z }), logId);
-    }
-    if (y < Math.floor(h / 4)) {
-      setBlock(dim.getBlock({ x: x + 1, y: wy, z: z + 1 }), logId);
-      setBlock(dim.getBlock({ x: x + 1, y: wy, z: z - 1 }), logId);
-      setBlock(dim.getBlock({ x: x - 1, y: wy, z: z + 1 }), logId);
-      setBlock(dim.getBlock({ x: x - 1, y: wy, z: z - 1 }), logId);
-    }
-    setBlock(dim.getBlock({ x, y: wy, z }), logId);
-    setBlock(dim.getBlock({ x, y: wy, z: z - 1 }), logId);
-    setBlock(dim.getBlock({ x, y: wy, z: z + 1 }), logId);
-    setBlock(dim.getBlock({ x: x + 1, y: wy, z }), logId);
-    setBlock(dim.getBlock({ x: x - 1, y: wy, z }), logId);
-  }
-  return [{ x, y: baseY + h, z }];
-}
-function placeCardinalTrunk(dim, x, baseY, z, h, logId) {
-  const atts = [];
-  for (let y = 0; y <= h - 2; y++) {
-    setBlock(dim.getBlock({ x, y: baseY + y, z }), logId);
-  }
-  const dirs = [[0, -1], [0, 1], [1, 0], [-1, 0]];
-  for (const [sx, sz] of dirs) {
-    let bx = sx, bz = sz;
-    setBlock(dim.getBlock({ x: x + bx, y: baseY + h - 2, z: z + bz }), logId);
-    setBlock(dim.getBlock({ x: x + bx, y: baseY + h - 1, z: z + bz }), logId);
-    bx += sx;
-    bz += sz;
-    setBlock(dim.getBlock({ x: x + bx, y: baseY + h - 1, z: z + bz }), logId);
-    bx += sx;
-    bz += sz;
-    setBlock(dim.getBlock({ x: x + bx, y: baseY + h, z: z + bz }), logId);
-    bx += sx;
-    bz += sz;
-    setBlock(dim.getBlock({ x: x + bx, y: baseY + h, z: z + bz }), logId);
-    bx += sx;
-    bz += sz;
-    atts.push({ x: x + bx, y: baseY + h, z: z + bz });
-  }
-  return atts;
-}
-function placeFourBranchTrunk(dim, x, baseY, z, h, logId) {
-  const atts = [];
-  for (let y = 0; y < h; y++) {
-    setBlock(dim.getBlock({ x, y: baseY + y, z }), logId);
-  }
-  const dirs = [[0, -1], [0, 1], [1, 0], [-1, 0]];
-  for (const [sx, sz] of dirs) {
-    let bx = sx, bz = sz;
-    const startY = Math.floor(h / 2);
-    for (let y = startY; y < h; y++) {
-      setBlock(dim.getBlock({ x: x + bx, y: baseY + y, z: z + bz }), logId);
-      if (y === h - 1) {
-        atts.push({ x: x + bx, y: baseY + y + 1, z: z + bz });
-      }
-      if (y % 2 === 0) {
-        bx += sx;
-        bz += sz;
-      }
-    }
-  }
-  atts.push({ x, y: baseY + h, z });
-  return atts;
-}
-function placeVaryingFourBranchTrunk(dim, x, baseY, z, h, logId, random) {
-  const atts = [];
-  const halfH = Math.floor(h / 2);
-  for (let y = 0; y <= halfH; y++) {
-    setBlock(dim.getBlock({ x, y: baseY + y, z }), logId);
-  }
-  const dirs = [[0, -1], [0, 1], [1, 0], [-1, 0]];
-  for (const [sx, sz] of dirs) {
-    let bx = 0, bz = 0;
-    const offset = Math.floor(random.nextFloat() * 3);
-    const startY = halfH - offset;
-    const branchLen = Math.floor(random.nextFloat() * 3) + 2;
-    for (let i = 0; i < branchLen; i++) {
-      bx += sx;
-      bz += sz;
-      setBlock(dim.getBlock({ x: x + bx, y: baseY + startY, z: z + bz }), logId);
-    }
-    for (let y = startY; y <= h - offset; y++) {
-      setBlock(dim.getBlock({ x: x + bx, y: baseY + y, z: z + bz }), logId);
-    }
-    atts.push({ x: x + bx, y: baseY + h - offset, z: z + bz });
-  }
-  return atts;
-}
-function placeFoliageForTree(dim, cx, cy, cz, treeId, leafId, random) {
-  if (treeId === "green_agate") {
-    placeLeavesRowThick(dim, cx, cy, cz, 1, -4, leafId, random);
-    placeLeavesRowThick(dim, cx, cy, cz, 2, -3, leafId, random);
-    placeLeavesRowThick(dim, cx, cy, cz, 3, -2, leafId, random);
-    placeLeavesRowThick(dim, cx, cy, cz, 3, -1, leafId, random);
-    placeLeavesRowThick(dim, cx, cy, cz, 2, 0, leafId, random);
-  } else if (treeId === "purple_agate") {
-    for (let y = 1; y >= -1; y--) {
-      placeLeavesRowBulb(dim, cx, cy, cz, 1, -y, leafId);
-    }
-  } else if (treeId === "blue_agate") {
-    const crownHeight = 1 + Math.floor(random.nextFloat() * 2);
-    const foliageH = 4 + Math.floor(random.nextFloat() * 3);
-    let r = 0;
-    for (let y = foliageH; y >= 0; y--) {
-      placeLeavesRowDefault(dim, cx, cy - (foliageH - y), cz, r, 0, leafId, random);
-      if (r >= 1 && y > 0 && y < crownHeight) r--;
-      else if (r < 2 + Math.floor(random.nextFloat() * 2)) r++;
-    }
-  } else if (treeId === "corrupted") {
-    const crownH = 3 + Math.floor(random.nextFloat() * 2);
-    for (let y = 0; y <= crownH; y++) {
-      const lr = y === 0 || y === crownH ? 0 : 1;
-      placeLeavesRowDefault(dim, cx, cy, cz, lr, -y, leafId, random);
-    }
-  } else if (treeId === "golden_small") {
-    for (let y = 1; y >= -1; y--) placeLeavesRowCube(dim, cx, cy, cz, 1, -y, leafId);
-  } else if (treeId === "golden_big") {
-    for (let y = 2; y >= -2; y--) placeLeavesRowCube(dim, cx, cy, cz, 2, -y, leafId);
-  } else if (treeId === "green_agate_bush") {
-    for (let y = 2; y >= 0; y--) placeLeavesRowBush(dim, cx, cy, cz, 2, -y, leafId, random);
-  } else if (treeId === "pink_agate" || treeId === "fossilized") {
-    placeLeavesRowCapped(dim, cx, cy, cz, 1, -5, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 2, -4, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 3, -3, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 3, -2, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 2, -1, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 1, 0, leafId, random);
-  } else if (treeId === "aura") {
-    placeLeavesRowCapped(dim, cx, cy, cz, 2, -1, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 1, 0, leafId, random);
-  } else {
-    placeLeavesRowCapped(dim, cx, cy, cz, 2, -1, leafId, random);
-    placeLeavesRowCapped(dim, cx, cy, cz, 1, 0, leafId, random);
-  }
-}
-function placeLeavesRowCapped(dim, cx, cy, cz, radius, yOff, leafId, random) {
-  const y = cy + yOff;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dz = -radius; dz <= radius; dz++) {
-      const ax = Math.abs(dx), az = Math.abs(dz);
-      if (yOff === 0) {
-        if ((ax > 1 || az > 1) && ax !== 0 && az !== 0) continue;
-      } else {
-        if (ax === radius && az === radius && radius > 0) continue;
-      }
-      setLeaf(dim, cx + dx, y, cz + dz, leafId);
-    }
-  }
-}
-function placeLeavesRowThick(dim, cx, cy, cz, radius, yOff, leafId, random) {
-  const y = cy + yOff;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dz = -radius; dz <= radius; dz++) {
-      const ax = Math.abs(dx), az = Math.abs(dz);
-      if (yOff === 0) {
-        if ((ax > 1 || az > 1) && ax !== 0 && az !== 0) continue;
-      } else if (yOff <= -4) {
-      } else {
-        if (ax === radius && az === radius && radius > 0) continue;
-      }
-      setLeaf(dim, cx + dx, y, cz + dz, leafId);
-    }
-  }
-}
-function placeLeavesRowBulb(dim, cx, cy, cz, radius, yOff, leafId) {
-  const y = cy + yOff;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dz = -radius; dz <= radius; dz++) {
-      if (Math.abs(dx) === radius && Math.abs(yOff) === radius && Math.abs(dz) === radius) continue;
-      setLeaf(dim, cx + dx, y, cz + dz, leafId);
-    }
-  }
-}
-function placeLeavesRowCube(dim, cx, cy, cz, radius, yOff, leafId) {
-  const y = cy + yOff;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dz = -radius; dz <= radius; dz++) {
-      setLeaf(dim, cx + dx, y, cz + dz, leafId);
-    }
-  }
-}
-function placeLeavesRowBush(dim, cx, cy, cz, radius, yOff, leafId, random) {
-  const y = cy + yOff;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dz = -radius; dz <= radius; dz++) {
-      if (Math.abs(dx) === radius && Math.abs(dz) === radius && random.nextFloat() < 0.5) continue;
-      setLeaf(dim, cx + dx, y, cz + dz, leafId);
-    }
-  }
-}
-function placeLeavesRowDefault(dim, cx, cy, cz, radius, yOff, leafId, random) {
-  const y = cy + yOff;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dz = -radius; dz <= radius; dz++) {
-      if (Math.abs(dx) === radius && Math.abs(dz) === radius && radius > 0) continue;
-      setLeaf(dim, cx + dx, y, cz + dz, leafId);
-    }
-  }
-}
-function setLeaf(dim, x, y, z, leafId) {
-  const block = dim.getBlock({ x, y, z });
-  if (block && block.typeId === "minecraft:air") {
-    try {
-      block.setType(leafId);
-    } catch (_) {
-    }
-  }
-}
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/definition-manager.ts
-import { world as world31, system as system38 } from "@minecraft/server";
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/biome-manager.ts
-var BiomeManager = class {
-  definition;
-  biomes;
-  table;
-  default;
-  constructor(definition, defaultBiome) {
-    this.definition = definition;
-    this.biomes = [];
-    this.table = null;
-    this.default = defaultBiome;
-    definition.finialize.subscribe(() => this.selfFinialize());
-  }
-  addBiome(biome) {
-    this.biomes.push(biome);
-  }
-  selfFinialize() {
-    const tempSteps = 20;
-    const humiSteps = 20;
-    let array = [];
-    for (let i = 0; i < tempSteps; i++) {
-      const temp = i / tempSteps;
-      const currentBiomes = [];
-      const tempMatches = this.biomes.filter((b) => temp >= b.temperature[0] && temp < b.temperature[1]);
-      for (let j = 0; j < humiSteps; j++) {
-        const humi = j / humiSteps;
-        const match = tempMatches.find((b) => humi >= b.humidity[0] && humi < b.humidity[1]) ?? this.default;
-        currentBiomes.push(match);
-      }
-      array.push(currentBiomes);
-    }
-    this.table = array;
-  }
-  getBiome(temperature, humidity) {
-    if (!this.table) return this.default;
-    const tempIdx = Math.floor(temperature * (this.table.length - 1));
-    const tempSlice = this.table[Math.max(0, Math.min(tempIdx, this.table.length - 1))];
-    const humiIdx = Math.floor(humidity * (tempSlice.length - 1));
-    return tempSlice[Math.max(0, Math.min(humiIdx, tempSlice.length - 1))] ?? this.default;
-  }
-  onPrecalculate(samples, seed2) {
-    this.biomes.forEach((e) => e.onPrecalculate(samples, seed2));
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/definition-manager.ts
-var DefinitionManager = class {
-  /**@readonly */
-  finialize;
-  /**@readonly */
-  precalculate;
-  /**@readonly */
-  treeDefinitions;
-  biomeManager;
-  __precalculated;
-  __precalculatedSamples;
-  constructor() {
-    this.finialize = new NativeEvent();
-    this.precalculate = new NativeEvent();
-    this.treeDefinitions = /* @__PURE__ */ new Map();
-    this.biomeManager = new BiomeManager(this, new BiomeDefinition("gaiadimension:crystal_plains"));
-    this.__precalculated = true;
-    this.__precalculatedSamples = 15;
-    system38.run(() => {
-      this.__precalculated = world31.getDynamicProperty("property-precalculated") ?? true;
-      this.__precalculatedSamples = world31.getDynamicProperty("property-precalculated-sampling") ?? 15;
-      if (this.__precalculatedSamples > 50) this.__precalculatedSamples = 50;
-    });
-  }
-  get IsPrecalculated() {
-    return this.__precalculated;
-  }
-  set IsPrecalculated(v) {
-    this.__precalculated = v;
-    world31.setDynamicProperty("property-precalculated", v);
-  }
-  get PrecalculatedSamples() {
-    return this.__precalculatedSamples;
-  }
-  set PrecalculatedSamples(v) {
-    this.__precalculatedSamples = v;
-    world31.setDynamicProperty("property-precalculated-sampling", v);
-  }
-  get IsPrecalculatedVariable() {
-    return world31.getDynamicProperty("property-precalculated") ?? false;
-  }
-  get IsPrecalculatedSamplesVariable() {
-    return world31.getDynamicProperty("property-precalculated-sampling") ?? 10;
-  }
-  triggerFinialize(seed2) {
-    system38.run(() => {
-      this.finialize.subscribe(() => {
-        let time = Date.now();
-        this.biomeManager.selfFinialize();
-        if (this.__precalculated) this.biomeManager.onPrecalculate(this.__precalculatedSamples, seed2);
-      });
-      this.finialize.trigger(seed2);
-    });
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/index.ts
-var DEFINITION_MANAGER = new DefinitionManager();
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/session-manager.ts
-var SessionManager = class {
-  generators;
-  seed;
-  procedural;
-  definition;
-  constructor(seed2) {
-    this.generators = /* @__PURE__ */ new Map();
-    this.seed = Math.ceil(seed2);
-    this.procedural = new ProceduralRandom(this.seed);
-    this.definition = DEFINITION_MANAGER;
-    this.getOrCreateGenerator("gaiadimension:gaia_dimension");
-    for (let i = 0; i < REALM_COUNT; i++) {
-      const realmId = `${REALM_PREFIX}${i}`;
-      this.getOrCreateGenerator(realmId, i);
-    }
-  }
-  getOrCreateGenerator(dimensionId, realmIndex) {
-    if (this.generators.has(dimensionId)) return this.generators.get(dimensionId);
-    try {
-      const dimension = world32.getDimension(dimensionId);
-      const genSeed = realmIndex !== void 0 ? new ProceduralRandom(this.seed + (realmIndex + 1) * 7919) : this.procedural;
-      const gen = new ChunkGenerator(this, dimension, genSeed);
-      this.generators.set(dimensionId, gen);
-      return gen;
-    } catch (e) {
-      return void 0;
-    }
-  }
-  get(dimension) {
-    return this.getOrCreateGenerator(dimension.id);
-  }
-  isGenerated(hash) {
-    return !!world32.getDynamicProperty(hash);
-  }
-  setGenerated(hash) {
-    world32.setDynamicProperty(hash, true);
-  }
-  getBiome(temp, humi) {
-    return this.definition.biomeManager.getBiome(temp, humi);
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/world_gen/index.ts
-var seed;
-system39.run(() => {
-  let savedSeed = world33.getDynamicProperty("seed");
-  if (!savedSeed) {
-    savedSeed = Math.ceil(Date.now() * Math.random() * 2);
-    world33.setDynamicProperty("seed", savedSeed);
-  }
-  seed = savedSeed;
-  SESSION_MANAGER.init(seed);
-});
-var SessionManagerProxy = class {
-  _instance;
-  _readyPromise;
-  _resolveReady;
-  constructor() {
-    this._readyPromise = new Promise((r) => this._resolveReady = r);
-  }
-  init(seed2) {
-    this._instance = new SessionManager(seed2);
-    this._resolveReady();
-  }
-  /** Resolves once init(seed) has been called and the SessionManager is live. */
-  get ready() {
-    return this._readyPromise;
-  }
-  get instance() {
-    return this._instance;
-  }
-  // Proxy common methods used by the generator
-  get(dim) {
-    return this._instance?.get(dim);
-  }
-  get seed() {
-    return this._instance?.seed ?? 0;
-  }
-  get procedural() {
-    return this._instance?.procedural;
-  }
-};
-var SESSION_MANAGER = new SessionManagerProxy();
-
-// src/main/bedrock/ts/world/worldgen/core/client/index.ts
-var initializedPlayers = /* @__PURE__ */ new Set();
-world34.afterEvents.worldLoad.subscribe(() => (async () => {
-  await SESSION_MANAGER.ready;
-  DEFINITION_MANAGER.triggerFinialize(SESSION_MANAGER.procedural);
-  for (const p of world34.getAllPlayers()) {
-    playerInitialize(p).catch((e) => console.error(e));
-  }
-})().catch((e) => console.error(e, e.stack)));
-world34.afterEvents.playerSpawn.subscribe((e) => {
-  if (e.initialSpawn) {
-    playerInitialize(e.player).catch((err) => console.error(err));
-  }
-});
-world34.beforeEvents.playerLeave.subscribe((e) => {
-  initializedPlayers.delete(e.player.id);
-  ClientChunk.open(SESSION_MANAGER, e.player).stop();
-});
-async function playerInitialize(player) {
-  if (initializedPlayers.has(player.id)) return;
-  initializedPlayers.add(player.id);
-  await SESSION_MANAGER.ready;
-  const local = ClientChunk.open(SESSION_MANAGER, player);
-  local.start();
-}
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/features/AuraShootsFeature.ts
-import { BlockPermutation as BlockPermutation19 } from "@minecraft/server";
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/features/Feature.ts
-var Feature = class {
-};
-
-// src/main/bedrock/ts/world/worldgen/core/definitions/features/AuraShootsFeature.ts
-var AuraShootsFeature = class extends Feature {
-  place(dim, random, worldX, worldZ, terrainMap, underwaterMap) {
-    for (let i = 0; i < 20; ++i) {
-      const centerX = Math.floor(random.nextFloat() * 16);
-      const centerZ = Math.floor(random.nextFloat() * 16);
-      const dx = Math.floor(random.nextFloat() * 4) - Math.floor(random.nextFloat() * 4);
-      const dz = Math.floor(random.nextFloat() * 4) - Math.floor(random.nextFloat() * 4);
-      let localX = centerX + dx;
-      let localZ = centerZ + dz;
-      if (localX < 0 || localX > 15 || localZ < 0 || localZ > 15) {
-        continue;
-      }
-      const tIdx = localX * 16 + localZ;
-      if (underwaterMap[tIdx]) continue;
-      const terrain = terrainMap[tIdx];
-      if (terrain === void 0) continue;
-      const txx = worldX + localX;
-      const tzz = worldZ + localZ;
-      const ty = terrain + 1;
-      const block = dim.getBlock({ x: txx, y: ty, z: tzz });
-      if (block && block.typeId === "minecraft:air") {
-        const ground = dim.getBlock({ x: txx, y: terrain, z: tzz });
-        if (!ground || !ground.typeId.includes("soil") && !ground.typeId.includes("grass") && !ground.typeId.includes("mookaite") && !ground.typeId.includes("dirt")) {
-          continue;
-        }
-        const height = 7 + Math.floor(random.nextFloat() * 5);
-        const color = Math.abs(txx % 5) + Math.abs(tzz % 5);
-        for (let k = 0; k < height; ++k) {
-          const currentY = ty + k;
-          const b = dim.getBlock({ x: txx, y: currentY, z: tzz });
-          if (b && (b.typeId === "minecraft:air" || b.typeId.includes("leaves") || b.typeId.includes("grass"))) {
-            const isTop = k + 1 === height;
-            const perm = BlockPermutation19.resolve("gaiadimension:aura_shoot", {
-              "gaiadimension:is_top": isTop,
-              "gaiadimension:color": color,
-              "gaiadimension:age": 0
-            });
-            try {
-              b.setPermutation(perm);
-            } catch (e) {
-              console.warn(`[GaiaDim] Failed to place Aura Shoot at ${txx},${currentY},${tzz}`);
-            }
-          } else {
-            break;
-          }
-        }
-      }
-    }
-  }
-};
-
-// src/main/bedrock/ts/world/worldgen/core/my_world/biomes.ts
-var pinkAgateTree = new SpruceTreeDefinition();
-pinkAgateTree.id = "pink_agate";
-pinkAgateTree.setLogPaletted(new PalettedBrush().add("gaiadimension:pink_agate_log"));
-pinkAgateTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:pink_agate_leaves"));
-pinkAgateTree.setHeight(5, 11);
-var blueAgateTree = new SpruceTreeDefinition();
-blueAgateTree.id = "blue_agate";
-blueAgateTree.setLogPaletted(new PalettedBrush().add("gaiadimension:blue_agate_log"));
-blueAgateTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:blue_agate_leaves"));
-blueAgateTree.setHeight(6, 9);
-var greenAgateTree = new SpruceTreeDefinition();
-greenAgateTree.id = "green_agate";
-greenAgateTree.setLogPaletted(new PalettedBrush().add("gaiadimension:green_agate_log"));
-greenAgateTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:green_agate_leaves"));
-greenAgateTree.setHeight(10, 16);
-var greenAgateBush = new SpruceTreeDefinition();
-greenAgateBush.id = "green_agate_bush";
-greenAgateBush.setLogPaletted(new PalettedBrush().add("gaiadimension:green_agate_log"));
-greenAgateBush.setLeavesPaletted(new PalettedBrush().add("gaiadimension:green_agate_leaves"));
-greenAgateBush.setHeight(1, 1);
-var purpleAgateTree = new SpruceTreeDefinition();
-purpleAgateTree.id = "purple_agate";
-purpleAgateTree.setLogPaletted(new PalettedBrush().add("gaiadimension:purple_agate_log"));
-purpleAgateTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:purple_agate_leaves"));
-purpleAgateTree.setHeight(7, 13);
-var fossilizedTree = new SpruceTreeDefinition();
-fossilizedTree.id = "fossilized";
-fossilizedTree.setLogPaletted(new PalettedBrush().add("gaiadimension:fossilized_log"));
-fossilizedTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:fossilized_leaves"));
-fossilizedTree.setHeight(5, 11);
-var corruptedTree = new SpruceTreeDefinition();
-corruptedTree.id = "corrupted";
-corruptedTree.setLogPaletted(new PalettedBrush().add("gaiadimension:corrupted_log"));
-corruptedTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:corrupted_leaves"));
-corruptedTree.setHeight(7, 11);
-var burntAgateTree = new PillarTreeDefinition("burnt");
-burntAgateTree.setLogPaletted(new PalettedBrush().add("gaiadimension:burnt_log"));
-burntAgateTree.setHeight(5, 11);
-var fireAgateTree = new PillarTreeDefinition("fire");
-fireAgateTree.setLogPaletted(new PalettedBrush().add("gaiadimension:fire_agate_log"));
-fireAgateTree.setHeight(5, 11);
-var auraTree = new SpruceTreeDefinition();
-auraTree.id = "aura";
-auraTree.setLogPaletted(new PalettedBrush().add("gaiadimension:aura_log"));
-auraTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:aura_leaves"));
-auraTree.setHeight(10, 16);
-var goldenTree = new SpruceTreeDefinition();
-goldenTree.id = "golden_small";
-goldenTree.setLogPaletted(new PalettedBrush().add("gaiadimension:golden_log"));
-goldenTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:golden_leaves"));
-goldenTree.setHeight(7, 11);
-var bigGoldenTree = new SpruceTreeDefinition();
-bigGoldenTree.id = "golden_big";
-bigGoldenTree.setLogPaletted(new PalettedBrush().add("gaiadimension:golden_log"));
-bigGoldenTree.setLeavesPaletted(new PalettedBrush().add("gaiadimension:golden_leaves"));
-bigGoldenTree.setHeight(9, 16);
-var bm = DEFINITION_MANAGER.biomeManager;
-bm.addBiome(new BiomeDefinition("gaiadimension:crystal_plains").setGroundPalette(new PalettedBrush().add("gaiadimension:crystal_plains_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 5).add("gaiadimension:crystal_growth_aura", 3).add("gaiadimension:thiscus", 2).add("gaiadimension:spotted_kersei", 1)).setVegetationChance(0.12).setDepth(0.05).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:pink_agate_forest").setGroundPalette(new PalettedBrush().add("gaiadimension:pink_agate_forest_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 3).add("gaiadimension:spotted_kersei", 2).add("gaiadimension:bulbous_hobina", 1)).setVegetationChance(0.15).setTrees(new TreePalette().add(pinkAgateTree)).setTreesPerChunk(4, 0.1, 1).setDepth(0.1).setScale(0.1));
-bm.addBiome(new BiomeDefinition("gaiadimension:blue_agate_taiga").setGroundPalette(new PalettedBrush().add("gaiadimension:blue_agate_taiga_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 3).add("gaiadimension:mystical_murgni", 2).add("gaiadimension:thorny_wiltha", 1)).setVegetationChance(0.1).setTrees(new TreePalette().add(blueAgateTree)).setTreesPerChunk(1, 0.1, 1).setDepth(0.1).setScale(0.2));
-bm.addBiome(new BiomeDefinition("gaiadimension:green_agate_jungle").setGroundPalette(new PalettedBrush().add("gaiadimension:green_agate_jungle_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 3).add("gaiadimension:agathum", 2).add("gaiadimension:stickly_cupsir", 2).add("gaiadimension:ouzium", 1)).setVegetationChance(0.2).setTrees(new TreePalette().add(greenAgateTree).add(greenAgateBush)).setTreesPerChunk(5, 0.1, 1).setDepth(0.1).setScale(0.2));
-bm.addBiome(new BiomeDefinition("gaiadimension:fossil_woodland").setGroundPalette(new PalettedBrush().add("gaiadimension:fossil_woodland_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 2).add("gaiadimension:sombre_shrub", 2)).setVegetationChance(0.08).setTrees(new TreePalette().add(fossilizedTree)).setTreesPerChunk(1, 0.1, 1).setDepth(0.1).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:volcanic_lands").setGroundPalette(new PalettedBrush().add("gaiadimension:volcanic_rock")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:volcanic_rock")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_seared", 3).add("gaiadimension:crystal_growth_red", 2)).setVegetationChance(0.04).setTrees(new TreePalette().add(burntAgateTree).add(fireAgateTree)).setTreesPerChunk(0, 0.1, 1).setDepth(1).setScale(0.7));
-bm.addBiome(new BiomeDefinition("gaiadimension:static_wasteland").setGroundPalette(new PalettedBrush().add("gaiadimension:wasteland_stone")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:static_stone")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_black", 3).add("gaiadimension:crystal_growth_mutant", 2)).setVegetationChance(0.03).setDepth(3).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:salt_dunes").setGroundPalette(new PalettedBrush().add("gaiadimension:salt")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:saltstone")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 2)).setVegetationChance(0.02).setDepth(0.2).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:smoldering_bog").setGroundPalette(new PalettedBrush().add("gaiadimension:smoldering_bog_murky_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:boggy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_seared", 3).add("gaiadimension:roofed_agaric", 2).add("gaiadimension:corrupted_varloom", 1)).setVegetationChance(0.12).setTrees(new TreePalette().add(fireAgateTree)).setTreesPerChunk(0, 0.1, 1).setDepth(0.2).setScale(0.02));
-bm.addBiome(new BiomeDefinition("gaiadimension:shining_grove").setGroundPalette(new PalettedBrush().add("gaiadimension:shining_grove_soft_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:light_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_aura", 5).add("gaiadimension:thiscus", 3).add("gaiadimension:spotted_kersei", 2)).setVegetationChance(0.15).setTrees(new TreePalette().add(auraTree)).setTreesPerChunk(2, 0.1, 1).addFeature(new AuraShootsFeature()).setDepth(0.4).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:mookaite_mesa").setGroundPalette(new PalettedBrush().add("gaiadimension:mookaite_mesa_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:auburn_mookaite")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_red", 2).add("gaiadimension:gold_orb_tucher", 1)).setVegetationChance(0.03).setDepth(2).setScale(0.075));
-bm.addBiome(new BiomeDefinition("gaiadimension:purple_agate_swamp").setGroundPalette(new PalettedBrush().add("gaiadimension:purple_agate_swamp_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth", 3).add("gaiadimension:corrupted_gaia_eye", 2).add("gaiadimension:corrupted_varloom", 2).add("gaiadimension:roofed_agaric", 1)).setVegetationChance(0.18).setTrees(new TreePalette().add(purpleAgateTree).add(corruptedTree)).setTreesPerChunk(1, 0.1, 2).setDepth(0).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:goldstone_lands").setGroundPalette(new PalettedBrush().add("gaiadimension:goldstone_lands_corrupted_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:corrupted_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_black", 3).add("gaiadimension:corrupted_gaia_eye", 2)).setVegetationChance(0.06).setTrees(new TreePalette().add(corruptedTree)).setTreesPerChunk(1, 0.1, 1).setDepth(0.125).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:mutant_agate_wildwood").setGroundPalette(new PalettedBrush().add("gaiadimension:mutant_agate_wildwood_glitter_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:heavy_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:crystal_growth_mutant", 4).add("gaiadimension:crystal_growth", 2).add("gaiadimension:glamelea", 1)).setVegetationChance(0.18).setTrees(new TreePalette().add(pinkAgateTree).add(blueAgateTree).add(greenAgateTree).add(purpleAgateTree)).setTreesPerChunk(2, 0.1, 1).setDepth(0.1).setScale(0.1));
-bm.addBiome(new BiomeDefinition("gaiadimension:golden_forest").setGroundPalette(new PalettedBrush().add("gaiadimension:golden_forest_gilded_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:aurum_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:golden_grass", 4).add("gaiadimension:twinkling_gilsri", 2).add("gaiadimension:elder_imklia", 1)).setVegetationChance(0.14).setTrees(new TreePalette().add(goldenTree, 3).add(bigGoldenTree)).setTreesPerChunk(2, 0.1, 1).setDepth(0.35).setScale(0.15));
-bm.addBiome(new BiomeDefinition("gaiadimension:golden_plains").setGroundPalette(new PalettedBrush().add("gaiadimension:golden_plains_gilded_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:aurum_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:golden_grass", 5).add("gaiadimension:tall_golden_grass", 2)).setVegetationChance(0.16).setDepth(0.35).setScale(0.1));
-bm.addBiome(new BiomeDefinition("gaiadimension:golden_hills").setGroundPalette(new PalettedBrush().add("gaiadimension:golden_hills_gilded_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:aurum_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:golden_grass", 3)).setVegetationChance(0.06).setDepth(0.8).setScale(0.5));
-bm.addBiome(new BiomeDefinition("gaiadimension:golden_sands").setGroundPalette(new PalettedBrush().add("gaiadimension:golden_sand")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:brilliant_stone")).setVegetationPalette(new PalettedBrush().add("gaiadimension:golden_grass", 2)).setVegetationChance(0.03).setDepth(0.25).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:golden_marsh").setGroundPalette(new PalettedBrush().add("gaiadimension:golden_marsh_gilded_grass")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:aurum_soil")).setVegetationPalette(new PalettedBrush().add("gaiadimension:golden_grass", 3).add("gaiadimension:twinkling_gilsri", 1)).setVegetationChance(0.1).setDepth(0.15).setScale(0.05));
-bm.addBiome(new BiomeDefinition("gaiadimension:mineral_reservoir").setGroundPalette(new PalettedBrush().add("gaiadimension:pebbles")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:saltstone")).setVegetationPalette(new PalettedBrush()).setVegetationChance(0).setDepth(-1.8).setScale(0.1));
-bm.addBiome(new BiomeDefinition("gaiadimension:mineral_river").setGroundPalette(new PalettedBrush().add("gaiadimension:pebbles")).setUnderGroundPalette(new PalettedBrush().add("gaiadimension:gaia_stone")).setVegetationPalette(new PalettedBrush()).setVegetationChance(0).setDepth(-0.8).setScale(0));
-
 // src/main/bedrock/ts/API/lib/EnchantmentLib.ts
-import { world as world35, system as system41, EquipmentSlot as EquipmentSlot7, GameMode as GameMode5 } from "@minecraft/server";
-import { ActionFormData as ActionFormData2 } from "@minecraft/server-ui";
+import { world as world31, system as system36, EquipmentSlot as EquipmentSlot7, GameMode as GameMode5 } from "@minecraft/server";
+import { CustomForm } from "@minecraft/server-ui";
+var ScoreboardBitPack = class {
+  static CATEGORY_BITS = {
+    sword: 1 << 0,
+    bow: 1 << 1,
+    crossbow: 1 << 2,
+    helmet: 1 << 3,
+    chestplate: 1 << 4,
+    leggings: 1 << 5,
+    boots: 1 << 6,
+    pickaxe: 1 << 7,
+    axe: 1 << 8,
+    shovel: 1 << 9,
+    hoe: 1 << 10,
+    mace: 1 << 11,
+    armor: 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6,
+    tools: 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10,
+    weapons: 1 << 0 | 1 << 1 | 1 << 2 | 1 << 11,
+    all: 4095
+  };
+  static categoriesToMask(categories) {
+    if (!categories || !Array.isArray(categories) || categories.length === 0) return 4095;
+    let mask = 0;
+    for (const cat of categories) {
+      const clean = (cat || "").toLowerCase().trim();
+      if (clean === "armor") {
+        mask |= this.CATEGORY_BITS.armor;
+      } else if (clean === "tool" || clean === "tools") {
+        mask |= this.CATEGORY_BITS.tools;
+      } else if (clean === "weapon" || clean === "weapons") {
+        mask |= this.CATEGORY_BITS.weapons;
+      } else if (this.CATEGORY_BITS[clean] !== void 0) {
+        mask |= this.CATEGORY_BITS[clean];
+      } else if (clean.includes("head") || clean.includes("helmet")) {
+        mask |= this.CATEGORY_BITS.helmet;
+      } else if (clean.includes("chest")) {
+        mask |= this.CATEGORY_BITS.chestplate;
+      } else if (clean.includes("leg")) {
+        mask |= this.CATEGORY_BITS.leggings;
+      } else if (clean.includes("boot") || clean.includes("feet")) {
+        mask |= this.CATEGORY_BITS.boots;
+      } else {
+        mask |= this.CATEGORY_BITS.sword;
+      }
+    }
+    return mask || 4095;
+  }
+  static maskToCategories(mask) {
+    const result = [];
+    if ((mask & 4095) === 4095) return ["all"];
+    const bitMap = [
+      [1 << 0, "sword"],
+      [1 << 1, "bow"],
+      [1 << 2, "crossbow"],
+      [1 << 3, "helmet"],
+      [1 << 4, "chestplate"],
+      [1 << 5, "leggings"],
+      [1 << 6, "boots"],
+      [1 << 7, "pickaxe"],
+      [1 << 8, "axe"],
+      [1 << 9, "shovel"],
+      [1 << 10, "hoe"],
+      [1 << 11, "mace"]
+    ];
+    for (const [bit, name] of bitMap) {
+      if ((mask & bit) !== 0) result.push(name);
+    }
+    return result.length > 0 ? result : ["all"];
+  }
+  static packEnchant(maxLevel = 1, costMultiplier = 3, appliesTo = [], flags = 0) {
+    const clampedLvl = Math.max(1, Math.min(15, maxLevel || 1));
+    const clampedCost = Math.max(1, Math.min(63, costMultiplier || 3));
+    const catMask = this.categoriesToMask(appliesTo);
+    const clampedFlags = Math.max(0, Math.min(255, flags || 0));
+    return clampedLvl & 15 | (clampedCost & 63) << 4 | (catMask & 4095) << 10 | (clampedFlags & 255) << 22;
+  }
+  static unpackEnchant(score) {
+    if (typeof score !== "number" || isNaN(score)) {
+      return { maxLevel: 1, costMultiplier: 3, appliesTo: ["all"], flags: 0 };
+    }
+    const maxLevel = score & 15 || 1;
+    const costMultiplier = score >> 4 & 63 || 3;
+    const catMask = score >> 10 & 4095;
+    const flags = score >> 22 & 255;
+    const appliesTo = this.maskToCategories(catMask);
+    return { maxLevel, costMultiplier, appliesTo, flags };
+  }
+  static packChars(chars) {
+    let packed = 0;
+    for (let i = 0; i < Math.min(4, chars.length); i++) {
+      const code = chars.charCodeAt(i) & 127;
+      packed |= code << i * 7;
+    }
+    return packed;
+  }
+  static unpackChars(score) {
+    let result = "";
+    for (let i = 0; i < 4; i++) {
+      const code = score >> i * 7 & 127;
+      if (code > 0) result += String.fromCharCode(code);
+    }
+    return result;
+  }
+  static setScoreboardData(key, value, objective = "ench_data") {
+    const cleanKey = key.startsWith("#") ? key : `#${key}`;
+    try {
+      let obj = world31.scoreboard.getObjective(objective);
+      if (!obj) {
+        try {
+          obj = world31.scoreboard.addObjective(objective, objective);
+        } catch (e) {
+          try {
+            const dim2 = world31.getDimension("overworld");
+            dim2?.runCommand?.(`scoreboard objectives add ${objective} dummy`);
+            obj = world31.scoreboard.getObjective(objective);
+          } catch (e2) {
+          }
+        }
+      }
+      if (obj) {
+        try {
+          obj.setScore(cleanKey, value);
+        } catch (e) {
+        }
+      }
+      const dim = world31.getDimension("overworld");
+      dim?.runCommand?.(`scoreboard players set ${cleanKey} ${objective} ${value}`);
+    } catch (err) {
+    }
+  }
+  static getScoreboardData(key, objective = "ench_data") {
+    const cleanKey = key.startsWith("#") ? key : `#${key}`;
+    try {
+      const obj = world31.scoreboard.getObjective(objective);
+      if (obj) {
+        const score = obj.getScore(cleanKey);
+        if (typeof score === "number") return score;
+      }
+    } catch (err) {
+    }
+    return null;
+  }
+};
 var EnchantmentManager = class {
   constructor() {
     this.registry = /* @__PURE__ */ new Map();
     this.uiCooldowns = /* @__PURE__ */ new Map();
+    this.playerActiveEnchants = /* @__PURE__ */ new Map();
     this.namespace = null;
-    this.hitboxEntities = /* @__PURE__ */ new Map();
-    this.isLeader = false;
+    this.limitChecker = null;
+    this.limitIncrementer = null;
+    this.economyProvider = null;
     this.initEvents();
   }
   /**
+   * Strips namespace prefix from an identifier (e.g. 'decayed:wither_shot' -> 'wither_shot').
+   * @param {string} id
+   * @returns {string}
+   */
+  cleanId(id) {
+    if (!id || typeof id !== "string") return "";
+    return id.includes(":") ? id.split(":")[1] : id;
+  }
+  /**
+   * Optional hook to configure custom craft limit validation.
+   * @param {(enchantId: string, player: Player) => { blocked: boolean, reason?: string }} fn
+   */
+  setLimitChecker(fn) {
+    this.limitChecker = fn;
+  }
+  /**
+   * Optional hook to configure craft count increments upon table enchantment.
+   * @param {(enchantId: string, player: Player) => void} fn
+   */
+  setLimitIncrementer(fn) {
+    this.limitIncrementer = fn;
+  }
+  /**
+   * Optional hook to configure custom economy (XP, scoreboard, items).
+   * @param {(player: Player) => { type: string, objective?: string }} fn
+   */
+  setEconomyProvider(fn) {
+    this.economyProvider = fn;
+  }
+  /**
    * Registers a new custom enchantment.
-   * Auto-detects addon namespace from the first enchantment ID (e.g. 'decayed:wither_shot' -> 'decayed').
+   * Automatically strips namespace prefix and publishes to universal scoreboard registry.
+   * @param {string} id
+   * @param {Object} config
    */
   register(id, config) {
+    if (!id || typeof id !== "string") {
+      throw new Error("[EnchantmentLib] Cannot register enchantment with invalid ID");
+    }
+    if (!config || !config.name) {
+      throw new Error(`[EnchantmentLib] Cannot register enchantment '${id}' without a name`);
+    }
     if (!this.namespace && id.includes(":")) {
       this.namespace = id.split(":")[0];
     }
-    this.registry.set(id, {
-      id,
+    const clean = this.cleanId(id);
+    const maxLevel = typeof config.maxLevel === "number" && config.maxLevel > 0 ? config.maxLevel : 1;
+    const costMultiplier = typeof config.costMultiplier === "number" && config.costMultiplier > 0 ? config.costMultiplier : typeof config.costPerLevel === "function" ? config.costPerLevel(1) : 3;
+    const appliesTo = Array.isArray(config.appliesTo) ? config.appliesTo : [];
+    const costPerLevel = typeof config.costPerLevel === "function" ? config.costPerLevel : ((lvl) => lvl * costMultiplier);
+    const entry = {
+      id: clean,
+      rawId: id,
       name: config.name,
       bookId: config.bookId || `${id}_book`,
-      maxLevel: config.maxLevel || 1,
-      appliesTo: config.appliesTo || [],
+      cleanBookId: this.cleanId(config.bookId || `${id}_book`),
+      maxLevel,
+      appliesTo,
+      tier: typeof config.tier === "number" ? config.tier : 1,
       entityHitEntity: config.entityHitEntity,
       playerBreakBlock: config.playerBreakBlock,
       onHurt: config.onHurt,
       projectileHitBlock: config.projectileHitBlock,
+      projectileHitEntity: config.projectileHitEntity,
+      onHit: config.onHit,
+      onBreak: config.onBreak,
       onTick: config.onTick,
-      costPerLevel: config.costPerLevel || ((lvl) => lvl * 3),
-      _costMultiplier: config.costMultiplier || 3
+      costPerLevel,
+      _costMultiplier: costMultiplier
+    };
+    this.registry.set(clean, entry);
+    if (id !== clean) {
+      this.registry.set(id, entry);
+    }
+    system36.run(() => {
+      try {
+        const packedScore = ScoreboardBitPack.packEnchant(
+          maxLevel,
+          costMultiplier,
+          appliesTo,
+          0
+        );
+        const fakePlayer = `#${clean}`;
+        let metaObj = world31.scoreboard.getObjective("ench_meta");
+        if (!metaObj) {
+          try {
+            metaObj = world31.scoreboard.addObjective("ench_meta", "Enchantment Metadata");
+          } catch (e) {
+            try {
+              const dim = world31.getDimension("overworld");
+              dim?.runCommand?.("scoreboard objectives add ench_meta dummy");
+              metaObj = world31.scoreboard.getObjective("ench_meta");
+            } catch (e2) {
+            }
+          }
+        }
+        if (metaObj) {
+          try {
+            metaObj.setScore(fakePlayer, packedScore);
+          } catch (e) {
+          }
+        }
+        try {
+          const dim = world31.getDimension("overworld");
+          dim?.runCommand?.(`scoreboard players set ${fakePlayer} ench_meta ${packedScore}`);
+        } catch (e) {
+        }
+        let reg = world31.scoreboard.getObjective("ench_reg");
+        if (!reg) {
+          try {
+            reg = world31.scoreboard.addObjective("ench_reg", "Enchantment Registry");
+          } catch (e) {
+            try {
+              const dim = world31.getDimension("overworld");
+              dim?.runCommand?.("scoreboard objectives add ench_reg dummy");
+              reg = world31.scoreboard.getObjective("ench_reg");
+            } catch (e2) {
+            }
+          }
+        }
+        if (reg) {
+          const costSample = typeof config.costPerLevel === "function" ? config.costPerLevel(1) : costMultiplier;
+          const typesStr = appliesTo.join(",");
+          const regKey = `#${clean}:${config.name}:${typesStr}:${maxLevel}:${costSample}`;
+          try {
+            reg.setScore(regKey, 1);
+          } catch (e) {
+            const dim = world31.getDimension("overworld");
+            dim?.runCommand?.(`scoreboard players set "${regKey}" ench_reg 1`);
+          }
+        }
+      } catch (err) {
+      }
     });
   }
-  get dummyEntityType() {
-    return this.namespace ? `${this.namespace}:enchant_dummy` : null;
+  /**
+   * Retrieves an enchantment definition by either clean or namespaced ID.
+   * @param {string} id
+   * @returns {Object | null}
+   */
+  get(id) {
+    if (!id) return null;
+    const clean = this.cleanId(id);
+    return this.registry.get(clean) || this.registry.get(id) || this.getAllAvailableEnchantments().get(clean) || null;
   }
   /**
-   * Helper to find enchant ID from book item ID.
+   * Returns merged map of local enchantments and external enchantments discovered via scoreboard.
+   * All map keys and config.id values are guaranteed to be clean, unprefixed IDs.
+   * @returns {Map<string, Object>}
+   */
+  getAllAvailableEnchantments() {
+    const merged = /* @__PURE__ */ new Map();
+    for (const [id, config] of this.registry) {
+      const clean = this.cleanId(id);
+      if (!merged.has(clean)) {
+        merged.set(clean, { ...config, id: clean });
+      }
+    }
+    try {
+      const metaObj = world31.scoreboard.getObjective("ench_meta");
+      if (metaObj) {
+        for (const participant of metaObj.getParticipants()) {
+          const rawName = typeof participant === "string" ? participant : participant?.displayName;
+          if (!rawName || !rawName.startsWith("#")) continue;
+          const id = this.cleanId(rawName.substring(1));
+          if (!id || merged.has(id)) continue;
+          const score = metaObj.getScore(participant);
+          if (typeof score === "number") {
+            const unpacked = ScoreboardBitPack.unpackEnchant(score);
+            const prettyName = id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+            merged.set(id, {
+              id,
+              rawId: id,
+              name: prettyName,
+              maxLevel: unpacked.maxLevel,
+              appliesTo: unpacked.appliesTo,
+              costPerLevel: (lvl) => lvl * unpacked.costMultiplier,
+              _costMultiplier: unpacked.costMultiplier
+            });
+          }
+        }
+      }
+    } catch (e) {
+    }
+    try {
+      const reg = world31.scoreboard.getObjective("ench_reg");
+      if (reg) {
+        for (const participant of reg.getParticipants()) {
+          const rawName = typeof participant === "string" ? participant : participant?.displayName;
+          if (!rawName || !rawName.startsWith("#") || !rawName.includes(":")) continue;
+          const clean = rawName.substring(1);
+          const parts = clean.split(":");
+          if (parts.length >= 5) {
+            const costStr = parts[parts.length - 1];
+            const maxLvlStr = parts[parts.length - 2];
+            const typesStr = parts[parts.length - 3];
+            const name = parts[parts.length - 4];
+            const rawId = parts.slice(0, parts.length - 4).join(":");
+            const id = this.cleanId(rawId);
+            if (merged.has(id)) {
+              const existing = merged.get(id);
+              if (name && (!existing.name || existing.name.toLowerCase() === id.replace(/_/g, " "))) {
+                existing.name = name;
+              }
+            } else {
+              const maxLevel = parseInt(maxLvlStr, 10) || 1;
+              const costMult = parseInt(costStr, 10) || 3;
+              merged.set(id, {
+                id,
+                rawId,
+                name,
+                maxLevel,
+                appliesTo: typesStr ? typesStr.split(",") : [],
+                costPerLevel: (lvl) => lvl * costMult,
+                _costMultiplier: costMult
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {
+    }
+    return merged;
+  }
+  /**
+   * Checks if a player is in Creative mode.
+   * @param {Player} player
+   * @returns {boolean}
+   */
+  isCreative(player) {
+    if (!player) return false;
+    try {
+      const mode = player.getGameMode ? player.getGameMode() : null;
+      if (typeof mode === "string") {
+        return mode.toLowerCase() === "creative";
+      }
+      if (typeof GameMode5 !== "undefined" && mode === GameMode5.creative) {
+        return true;
+      }
+    } catch (e) {
+    }
+    return false;
+  }
+  /**
+   * Semantic equipment compatibility matcher.
+   * Maps vanilla and custom modded weapons, armor, and tools to target equipment types.
+   * @param {ItemStack} item
+   * @param {string[]} appliesTo
+   * @returns {boolean}
+   */
+  isItemCompatible(item, appliesTo) {
+    if (!item || !appliesTo || appliesTo.length === 0) return false;
+    const rawType = (item.typeId || "").toLowerCase();
+    const cleanType = (rawType.includes(":") ? rawType.split(":")[1] : rawType).replace(/_/g, " ");
+    return appliesTo.some((type2) => {
+      const t = (type2 || "").toLowerCase().trim();
+      if (!t) return false;
+      if (cleanType.includes(t)) return true;
+      if (t === "sword") {
+        return cleanType.includes("blade") || cleanType.includes("dagger") || cleanType.includes("katana") || cleanType.includes("saber") || cleanType.includes("rapier") || cleanType.includes("broadsword");
+      }
+      if (t === "boots") {
+        return cleanType.includes("boot");
+      }
+      if (t === "leggings") {
+        return cleanType.includes("legging") || cleanType.includes("pants");
+      }
+      if (t === "chestplate") {
+        return cleanType.includes("chest") || cleanType.includes("tunic");
+      }
+      if (t === "helmet") {
+        return cleanType.includes("cap") || cleanType.includes("helm") || cleanType.includes("hood");
+      }
+      if (t === "bow") {
+        return cleanType.includes("bow") && !cleanType.includes("crossbow");
+      }
+      if (t === "crossbow") {
+        return cleanType.includes("crossbow");
+      }
+      if (t === "axe") {
+        return cleanType.includes("axe") && !cleanType.includes("pickaxe");
+      }
+      if (t === "pickaxe") {
+        return cleanType.includes("pickaxe") || cleanType.includes("pick");
+      }
+      if (t === "shovel") {
+        return cleanType.includes("shovel") || cleanType.includes("spade");
+      }
+      if (t === "hoe") {
+        return cleanType.includes("hoe") || cleanType.includes("scythe") || cleanType.includes("mattock");
+      }
+      if (t === "trident") {
+        return cleanType.includes("trident") || cleanType.includes("spear");
+      }
+      if (t === "mace") {
+        return cleanType.includes("mace") || cleanType.includes("hammer");
+      }
+      if (t === "elytra") {
+        return cleanType.includes("elytra") || cleanType.includes("wings");
+      }
+      if (t === "shield") {
+        return cleanType.includes("shield");
+      }
+      if (t === "fishing_rod") {
+        return cleanType.includes("fishing rod") || cleanType.includes("rod");
+      }
+      if (t === "shears") {
+        return cleanType.includes("shears");
+      }
+      if (t === "book") {
+        return cleanType.includes("book");
+      }
+      return false;
+    });
+  }
+  /**
+   * Helper to find clean enchant ID from a book item.
+   * Prioritizes authoritative lore, then item typeId patterns.
+   * @param {ItemStack} itemStack
+   * @returns {string | null}
    */
   getEnchantFromBook(itemStack) {
     if (!itemStack) return null;
-    for (const [id, config] of this.registry) {
-      if (config.bookId === itemStack.typeId) {
-        return id;
+    const enchants = this.getEnchantments(itemStack);
+    const keys = Object.keys(enchants);
+    if (keys.length > 0) {
+      return this.cleanId(keys[0]);
+    }
+    const rawType = (itemStack.typeId || "").toLowerCase();
+    const cleanType = this.cleanId(rawType);
+    const allAvailable = this.getAllAvailableEnchantments();
+    for (const [id, config] of allAvailable) {
+      if (config.bookId) {
+        const cleanBookId = this.cleanId(config.bookId).toLowerCase();
+        if (cleanType === cleanBookId || cleanType.startsWith(cleanBookId + "_")) {
+          return id;
+        }
       }
+    }
+    if (cleanType.includes("enchanted_book_")) {
+      const suffix = cleanType.replace("enchanted_book_", "");
+      const match = suffix.match(/^(.+)_(\d+)$/);
+      const rawEnchantId = match ? match[1] : suffix;
+      return this.cleanId(rawEnchantId);
     }
     return null;
   }
-  initEvents() {
-    system41.runInterval(() => this.manageVisuals(), 5);
-    system41.runInterval(() => this.manageDummies(), 10);
-    system41.runInterval(() => this.electLeader(), 20);
-    world35.afterEvents.playerInteractWithEntity.subscribe((ev) => {
-      if (!this.isLeader) return;
-      const { player, target } = ev;
-      if (!target.hasTag("mirage_enchant_dummy")) return;
-      const now = Date.now();
-      if (this.uiCooldowns.has(player.id) && now - this.uiCooldowns.get(player.id) < 1e3) {
-        return;
+  /**
+   * Returns true if the item can receive at least one registered custom enchantment.
+   * In Creative mode, returns true for any valid item.
+   * @param {ItemStack} item
+   * @param {Player} [player]
+   * @returns {boolean}
+   */
+  hasAnyApplicableEnchant(item, player) {
+    if (!item) return false;
+    if (this.isCreative(player)) return true;
+    const currentEnchants = this.getEnchantments(item);
+    for (const [id, config] of this.getAllAvailableEnchantments()) {
+      if (!this.isItemCompatible(item, config.appliesTo)) continue;
+      const currentLevel = currentEnchants[id] || 0;
+      if (currentLevel < config.maxLevel) {
+        return true;
       }
-      this.uiCooldowns.set(player.id, now);
-      world35.setDynamicProperty("mirage:shared_registry", JSON.stringify({}));
-      player.runCommand(`scriptevent mirage:broadcast_enchants`);
-      system41.runTimeout(() => {
-        this.openEnchantmentUI(player);
-      }, 3);
-    });
-    system41.afterEvents.scriptEventReceive.subscribe((ev) => {
-      if (ev.id === "mirage:broadcast_enchants") {
-        let shared = {};
+    }
+    return false;
+  }
+  /**
+   * Checks if an enchantment is blocked by craft limits or configuration.
+   * @param {string} enchantId
+   * @param {Player} player
+   * @returns {{ blocked: boolean, reason?: string }}
+   */
+  checkEnchantLimit(enchantId, player) {
+    if (this.isCreative(player)) return { blocked: false };
+    if (this.limitChecker) {
+      return this.limitChecker(enchantId, player);
+    }
+    if (typeof Database !== "undefined" && Database.getConfig && Database.getCraftCount) {
+      const limitMap = {
+        lifesteal: "craft_limit_lifesteal_book",
+        vampirism: "craft_limit_vampirism_book",
+        soulbound: "craft_limit_soulbound_book",
+        soul_tether: "craft_limit_soul_tether_book",
+        heart_shield: "craft_limit_heart_shield_book",
+        last_stand: "craft_limit_last_stand_book"
+      };
+      const recipeMap = {
+        lifesteal: "ks_lifesteal:enchanted_book_lifesteal_1",
+        vampirism: "ks_lifesteal:enchanted_book_vampirism_1",
+        soulbound: "ks_lifesteal:enchanted_book_soulbound_1",
+        soul_tether: "ks_lifesteal:enchanted_book_soul_tether_1",
+        heart_shield: "ks_lifesteal:enchanted_book_heart_shield_1",
+        last_stand: "ks_lifesteal:enchanted_book_last_stand_1"
+      };
+      const limitKey = limitMap[enchantId];
+      const recipeId = recipeMap[enchantId];
+      if (limitKey && recipeId) {
+        const playerLimit = Database.getConfig(`${limitKey}_per_player`);
+        const globalLimit = Database.getConfig(`${limitKey}_global`);
+        const playerCrafts = Database.getCraftCount(player, recipeId);
+        const globalCrafts = Database.getGlobalCraftCount(recipeId);
+        if (playerLimit > -1 && playerCrafts >= playerLimit) {
+          return { blocked: true, reason: `\xA7cPersonal limit reached (${playerCrafts}/${playerLimit})` };
+        }
+        if (globalLimit > -1 && globalCrafts >= globalLimit) {
+          return { blocked: true, reason: `\xA7cGlobal limit reached (${globalCrafts}/${globalLimit})` };
+        }
+      }
+    }
+    return { blocked: false };
+  }
+  /**
+   * Increments craft count for an enchantment applied via table or anvil.
+   * @param {string} enchantId
+   * @param {Player} player
+   */
+  incrementEnchantCount(enchantId, player) {
+    if (this.isCreative(player)) return;
+    if (this.limitIncrementer) {
+      this.limitIncrementer(enchantId, player);
+      return;
+    }
+    if (typeof Database !== "undefined" && Database.incrementCraftCount) {
+      const recipeMap = {
+        lifesteal: "ks_lifesteal:enchanted_book_lifesteal_1",
+        vampirism: "ks_lifesteal:enchanted_book_vampirism_1",
+        soulbound: "ks_lifesteal:enchanted_book_soulbound_1",
+        soul_tether: "ks_lifesteal:enchanted_book_soul_tether_1",
+        heart_shield: "ks_lifesteal:enchanted_book_heart_shield_1",
+        last_stand: "ks_lifesteal:enchanted_book_last_stand_1"
+      };
+      const recipeId = recipeMap[enchantId];
+      if (recipeId) {
+        Database.incrementCraftCount(player, recipeId);
+      }
+    }
+  }
+  /**
+   * Resolves the economy configuration for a player interaction.
+   * @param {Player} player
+   * @returns {{ type: 'xp' | 'scoreboard', objective: string }}
+   */
+  getEconomy(player) {
+    if (this.economyProvider) {
+      return this.economyProvider(player);
+    }
+    if (typeof Database !== "undefined" && Database.getConfig) {
+      return {
+        type: Database.getConfig("enchantment_economy_type") || "xp",
+        objective: Database.getConfig("enchantment_scoreboard_objective") || "money"
+      };
+    }
+    return { type: "xp", objective: "money" };
+  }
+  /**
+   * Checks and claims a synchronous scoreboard mutex lock for the specified action.
+   * @param {string} mutexKey e.g. '#ui_lock' or '#anvil_lock'
+   * @param {number} debounceTicks Debounce window (default 20 ticks = 1s)
+   * @returns {boolean} True if the lock was acquired, false if locked by another addon
+   */
+  claimScoreboardMutex(mutexKey = "#ui_lock", debounceTicks = 20) {
+    try {
+      let bus = world31.scoreboard.getObjective("ench_bus");
+      if (!bus) {
         try {
-          const data = world35.getDynamicProperty("mirage:shared_registry");
-          if (data) shared = JSON.parse(data);
+          const dim = world31.getDimension("overworld");
+          dim?.runCommand?.("scoreboard objectives add ench_bus dummy");
+          bus = world31.scoreboard.getObjective("ench_bus");
         } catch (e) {
-        }
-        for (const [id, config] of this.registry) {
-          shared[id] = {
-            id: config.id,
-            name: config.name,
-            maxLevel: config.maxLevel,
-            appliesTo: config.appliesTo,
-            _costMultiplier: config._costMultiplier
-          };
-        }
-        world35.setDynamicProperty("mirage:shared_registry", JSON.stringify(shared));
-      }
-      if (ev.id === "mirage:apply_enchant") {
-        try {
-          const data = JSON.parse(ev.message);
-          if (this.registry.has(data.enchantId)) {
-            const player = ev.sourceEntity;
-            if (!player) return;
-            const inventory = player.getComponent("minecraft:inventory").container;
-            const item = inventory.getItem(data.slot);
-            if (!item || item.typeId !== data.itemTypeId) return;
-            if (player.getGameMode() !== GameMode5.Creative) {
-              player.addLevels(-data.cost);
-            }
-            this.applyEnchantment(item, data.enchantId, data.level);
-            inventory.setItem(data.slot, item);
-            player.dimension.spawnParticle("minecraft:enchanting_table_particle", player.location);
-            player.playSound("random.levelup");
-            const enchantName = this.registry.get(data.enchantId).name;
-            player.sendMessage(`\xA7aSuccessfully enchanted with ${enchantName} ${data.level}!`);
+          try {
+            bus = world31.scoreboard.addObjective("ench_bus", "Enchantment Bus");
+          } catch (e2) {
           }
-        } catch (e) {
+        }
+      }
+      const currentTick = typeof system36?.currentTick === "number" ? system36.currentTick : Math.floor(Date.now() / 50);
+      const lastClaimedTick = bus?.getScore(mutexKey) ?? -999;
+      if (currentTick - lastClaimedTick < debounceTicks) {
+        return false;
+      }
+      try {
+        bus?.setScore(mutexKey, currentTick);
+      } catch (e) {
+        const dim = world31.getDimension("overworld");
+        dim?.runCommand?.(`scoreboard players set "${mutexKey}" ench_bus ${currentTick}`);
+      }
+      return true;
+    } catch (err) {
+      return true;
+    }
+  }
+  /**
+   * Mirrors active equipped custom enchantments onto player scoreboards (ench_<id>).
+   * Enables vanilla commands (/execute as @a[scores={ench_<id>=1..}]),
+   * animation controllers, and Molang queries to react to active enchantments.
+   * Executed on a 2-tick interval.
+   */
+  mirrorPlayerScoreboards() {
+    if (typeof world31 === "undefined" || !world31.scoreboard || !world31.getAllPlayers) return;
+    for (const player of world31.getAllPlayers()) {
+      if (!player || !player.isValid) continue;
+      const equip = player.getComponent("minecraft:equippable");
+      if (!equip) continue;
+      const activeEnchants = /* @__PURE__ */ new Map();
+      const slots = [
+        EquipmentSlot7.Mainhand,
+        EquipmentSlot7.Offhand,
+        EquipmentSlot7.Head,
+        EquipmentSlot7.Chest,
+        EquipmentSlot7.Legs,
+        EquipmentSlot7.Feet
+      ];
+      for (const slot of slots) {
+        const item = equip.getEquipment(slot);
+        if (!item) continue;
+        const enchants = this.getEnchantments(item);
+        for (const [id, level] of Object.entries(enchants)) {
+          const clean = this.cleanId(id);
+          const currentMax = activeEnchants.get(clean) || 0;
+          if (level > currentMax) {
+            activeEnchants.set(clean, level);
+          }
+        }
+      }
+      let trackedSet = this.playerActiveEnchants.get(player.id);
+      if (!trackedSet) {
+        trackedSet = /* @__PURE__ */ new Set();
+        this.playerActiveEnchants.set(player.id, trackedSet);
+      }
+      for (const [id, level] of activeEnchants) {
+        const objName = `ench_${id}`;
+        let obj = world31.scoreboard.getObjective(objName);
+        if (!obj) {
+          try {
+            obj = world31.scoreboard.addObjective(objName, `Ench: ${id}`);
+          } catch (e1) {
+            try {
+              const dim = world31.getDimension("overworld");
+              dim?.runCommand?.(`scoreboard objectives add "${objName}" dummy`);
+              obj = world31.scoreboard.getObjective(objName);
+            } catch (e2) {
+            }
+          }
+        }
+        if (obj) {
+          try {
+            const currentScore = obj.getScore(player);
+            if (currentScore !== level) {
+              obj.setScore(player, level);
+            }
+          } catch (e) {
+            try {
+              const dim = world31.getDimension("overworld");
+              dim?.runCommand?.(`scoreboard players set @a[name="${player.name}"] "${objName}" ${level}`);
+            } catch (e2) {
+            }
+          }
+        }
+        trackedSet.add(id);
+      }
+      for (const oldId of trackedSet) {
+        if (!activeEnchants.has(oldId)) {
+          const objName = `ench_${oldId}`;
+          const obj = world31.scoreboard.getObjective(objName);
+          if (obj) {
+            try {
+              const score = obj.getScore(player);
+              if (score !== 0 && typeof score === "number") {
+                obj.setScore(player, 0);
+              }
+            } catch (e) {
+              try {
+                const dim = world31.getDimension("overworld");
+                dim?.runCommand?.(`scoreboard players set @a[name="${player.name}"] "${objName}" 0`);
+              } catch (e2) {
+              }
+            }
+          }
+          trackedSet.delete(oldId);
+        }
+      }
+    }
+  }
+  initEvents() {
+    system36.runInterval?.(() => this.manageVisuals(), 5);
+    system36.runInterval?.(() => this.mirrorPlayerScoreboards(), 2);
+    world31.afterEvents?.playerLeave?.subscribe?.((ev) => {
+      if (ev?.playerId) {
+        this.playerActiveEnchants.delete(ev.playerId);
+        this.uiCooldowns.delete(ev.playerId);
+      }
+    });
+    world31.afterEvents?.playerPlaceBlock?.subscribe?.((ev) => {
+      const { block, player } = ev;
+      if (!block || !player || !player.isValid) return;
+      if (block.typeId === "minecraft:enchanting_table") {
+        player.sendMessage?.("\xA7d[Enchantment] \xA7eSneak + Interact to access Custom Enchantments!");
+        player.onScreenDisplay?.setActionBar?.("\xA7dSneak + Interact to access Custom Enchantments!");
+      } else if (block.typeId.includes("anvil")) {
+        player.sendMessage?.("\xA7d[Anvil] \xA7eSneak + Interact with a Custom Book to combine!");
+        player.onScreenDisplay?.setActionBar?.("\xA7dSneak + Interact with a Custom Book to combine!");
+      }
+    });
+    world31.beforeEvents?.playerInteractWithBlock?.subscribe?.((ev) => {
+      const { block, player } = ev;
+      if (!player || !player.isValid) return;
+      if (block.typeId === "minecraft:enchanting_table") {
+        if (!player.isSneaking) return;
+        ev.cancel = true;
+        system36.run(() => {
+          if (!player.isValid) return;
+          if (!this.claimScoreboardMutex("#ui_lock", 20)) {
+            return;
+          }
+          const now = Date.now();
+          if (this.uiCooldowns.has(player.id) && now - this.uiCooldowns.get(player.id) < 500) return;
+          this.uiCooldowns.set(player.id, now);
+          this.openEnchantmentUI(player);
+        });
+      } else if (block.typeId.includes("anvil")) {
+        const equippable = player.getComponent("minecraft:equippable");
+        const itemStack = equippable?.getEquipment(EquipmentSlot7.Mainhand);
+        const enchantId = this.getEnchantFromBook(itemStack);
+        if (enchantId) {
+          ev.cancel = true;
+          system36.run(() => {
+            if (!player.isValid) return;
+            if (!this.claimScoreboardMutex("#anvil_lock", 20)) {
+              return;
+            }
+            const now = Date.now();
+            if (this.uiCooldowns.has(player.id) && now - this.uiCooldowns.get(player.id) < 500) return;
+            this.uiCooldowns.set(player.id, now);
+            player.dimension?.spawnParticle?.("minecraft:villager_happy", {
+              x: block.location.x + 0.5,
+              y: block.location.y + 1,
+              z: block.location.z + 0.5
+            });
+            player.playSound?.("random.anvil_use");
+            this.openAnvilBookApplyUI(player, itemStack, enchantId);
+          });
         }
       }
     });
-    world35.afterEvents.playerInteractWithBlock.subscribe((ev) => {
-      if (!this.isLeader) return;
-      const { player, block } = ev;
-      if (!player.isSneaking) return;
-      if (this.registry.size === 0) return;
-      if (!block.typeId.includes("anvil")) return;
-      const now = Date.now();
-      if (this.uiCooldowns.has(player.id) && now - this.uiCooldowns.get(player.id) < 1e3) return;
-      const equippable = player.getComponent("minecraft:equippable");
-      const itemStack = equippable?.getEquipment(EquipmentSlot7.Mainhand);
-      const enchantId = this.getEnchantFromBook(itemStack);
-      if (enchantId) {
-        this.uiCooldowns.set(player.id, now);
-        player.dimension.spawnParticle("minecraft:villager_happy", {
-          x: block.location.x + 0.5,
-          y: block.location.y + 1,
-          z: block.location.z + 0.5
-        });
-        player.playSound("random.anvil_use");
-        this.openAnvilBookApplyUI(player, itemStack, enchantId);
-      }
-    });
-    world35.afterEvents.playerPlaceBlock.subscribe((ev) => {
-      const { block, player } = ev;
-      if (block.typeId === "minecraft:enchanting_table") {
-        player.sendMessage("\xA7d[Enchantment] \xA7eInteract with the table to access Custom Enchantments!");
-      } else if (block.typeId.includes("anvil")) {
-        player.sendMessage("\xA7d[Anvil] \xA7eSneak + Interact with a Custom Book to combine!");
-      }
-    });
-    world35.afterEvents.entityHitEntity.subscribe((ev) => {
-      const { damagingEntity, hitEntity } = ev;
-      if (!damagingEntity || !damagingEntity.isValid || !damagingEntity.getComponent("minecraft:equippable")) return;
+    world31.afterEvents?.entityHitEntity?.subscribe?.((ev) => {
+      const { damagingEntity } = ev;
+      if (!damagingEntity || !damagingEntity.isValid) return;
       const equippable = damagingEntity.getComponent("minecraft:equippable");
-      const mainHand = equippable.getEquipment("Mainhand");
+      const mainHand = equippable?.getEquipment(EquipmentSlot7.Mainhand);
       if (mainHand) {
         this.triggerEnchants(mainHand, "entityHitEntity", ev);
       }
     });
-    world35.afterEvents.playerBreakBlock.subscribe((ev) => {
-      const { player, itemStack } = ev;
+    world31.afterEvents?.playerBreakBlock?.subscribe?.((ev) => {
+      const { itemStack } = ev;
       if (itemStack) {
         this.triggerEnchants(itemStack, "playerBreakBlock", ev);
       }
     });
-    world35.afterEvents.entityHurt.subscribe((ev) => {
+    world31.afterEvents?.entityHurt?.subscribe?.((ev) => {
       const { hurtEntity } = ev;
-      if (!hurtEntity || !hurtEntity.isValid || !hurtEntity.getComponent("minecraft:equippable")) return;
+      if (!hurtEntity || !hurtEntity.isValid) return;
       const equippable = hurtEntity.getComponent("minecraft:equippable");
-      const armorSlots = ["Head", "Chest", "Legs", "Feet"];
+      if (!equippable) return;
+      const armorSlots = [EquipmentSlot7.Head, EquipmentSlot7.Chest, EquipmentSlot7.Legs, EquipmentSlot7.Feet];
       for (const slot of armorSlots) {
         const item = equippable.getEquipment(slot);
         if (item) this.triggerEnchants(item, "onHurt", ev);
       }
     });
-    world35.afterEvents.projectileHitBlock.subscribe((ev) => {
+    world31.afterEvents?.projectileHitBlock?.subscribe?.((ev) => {
       const { source } = ev;
-      if (!source || !source.isValid || !source.getComponent("minecraft:equippable")) return;
+      if (!source || !source.isValid) return;
       const equippable = source.getComponent("minecraft:equippable");
-      const mainHand = equippable.getEquipment("Mainhand");
+      const mainHand = equippable?.getEquipment(EquipmentSlot7.Mainhand);
       if (mainHand) this.triggerEnchants(mainHand, "projectileHitBlock", ev);
+    });
+    world31.afterEvents?.projectileHitEntity?.subscribe?.((ev) => {
+      const { source } = ev;
+      if (!source || !source.isValid) return;
+      const equippable = source.getComponent("minecraft:equippable");
+      const mainHand = equippable?.getEquipment(EquipmentSlot7.Mainhand);
+      if (mainHand) this.triggerEnchants(mainHand, "projectileHitEntity", ev);
     });
   }
   /**
-   * Triggers registered callbacks for an item's enchants.
+   * Executes registered callbacks for all custom enchantments present on an item.
+   * @param {ItemStack} itemStack
+   * @param {string} triggerType
+   * @param {Object} eventData
    */
   triggerEnchants(itemStack, triggerType, eventData) {
     const enchants = this.getEnchantments(itemStack);
     for (const [id, level] of Object.entries(enchants)) {
-      const config = this.registry.get(id);
-      if (config && config[triggerType]) {
+      const clean = this.cleanId(id);
+      const config = this.registry.get(clean) || this.registry.get(id);
+      if (!config) continue;
+      if (typeof config[triggerType] === "function") {
         config[triggerType](eventData, level);
+      } else if (triggerType === "entityHitEntity" && typeof config.onHit === "function") {
+        config.onHit(eventData, level);
+      } else if (triggerType === "playerBreakBlock" && typeof config.onBreak === "function") {
+        config.onBreak(eventData, level);
       }
-    }
-  }
-  /**
-   * Leader Election — only ONE instance across all addons handles UI & dummies.
-   * Each instance writes a heartbeat. The lowest alphabetical namespace wins.
-   * Non-leaders deactivate dummy management and UI handling.
-   */
-  electLeader() {
-    if (!this.namespace) return;
-    const now = Date.now();
-    try {
-      world35.setDynamicProperty(`mirage:enchant_hb_${this.namespace}`, now);
-    } catch (e) {
-    }
-    let instances = [];
-    try {
-      const data = world35.getDynamicProperty("mirage:enchant_instances");
-      if (data) instances = JSON.parse(data);
-    } catch (e) {
-    }
-    if (!instances.includes(this.namespace)) {
-      instances.push(this.namespace);
-      try {
-        world35.setDynamicProperty("mirage:enchant_instances", JSON.stringify(instances));
-      } catch (e) {
-      }
-    }
-    const alive = instances.filter((ns) => {
-      try {
-        const hb = world35.getDynamicProperty(`mirage:enchant_hb_${ns}`);
-        return hb && now - hb < 5e3;
-      } catch (e) {
-        return false;
-      }
-    });
-    if (alive.length !== instances.length) {
-      try {
-        world35.setDynamicProperty("mirage:enchant_instances", JSON.stringify(alive));
-      } catch (e) {
-      }
-    }
-    alive.sort();
-    const wasLeader = this.isLeader;
-    this.isLeader = alive.length > 0 && alive[0] === this.namespace;
-    if (this.isLeader && !wasLeader) {
-    }
-  }
-  // --- Dummy Entity Management ---
-  /**
-   * For each player, checks if they're near an enchanting table.
-   * Spawns/maintains a dummy entity on top of it for interaction.
-   * Only runs if this instance is the elected leader.
-   */
-  manageDummies() {
-    if (!this.namespace || this.registry.size === 0) return;
-    if (!this.isLeader) return;
-    const activePlayers = /* @__PURE__ */ new Set();
-    for (const player of world35.getAllPlayers()) {
-      if (!player.isValid) continue;
-      activePlayers.add(player.id);
-      this.updateHitboxDummy(player);
-    }
-    for (const [pid, entity] of this.hitboxEntities) {
-      if (!activePlayers.has(pid)) {
-        try {
-          if (entity?.isValid && entity.typeId === this.dummyEntityType) {
-            entity.remove();
-          }
-        } catch {
-        }
-        this.hitboxEntities.delete(pid);
-      }
-    }
-  }
-  updateHitboxDummy(player) {
-    const existing = this.hitboxEntities.get(player.id);
-    if (!player.isSneaking) {
-      if (existing?.isValid && existing.typeId === this.dummyEntityType) {
-        try {
-          existing.remove();
-        } catch {
-        }
-      }
-      this.hitboxEntities.delete(player.id);
-      return;
-    }
-    const loc = player.location;
-    const dim = player.dimension;
-    let bestTablePos = null;
-    let minDistanceSq = Infinity;
-    const R = 4;
-    for (let dx = -R; dx <= R; dx++) {
-      for (let dz = -R; dz <= R; dz++) {
-        for (let dy = -2; dy <= 2; dy++) {
-          try {
-            const block = dim.getBlock({
-              x: Math.floor(loc.x) + dx,
-              y: Math.floor(loc.y) + dy,
-              z: Math.floor(loc.z) + dz
-            });
-            if (block?.typeId === "minecraft:enchanting_table") {
-              const bLoc = block.location;
-              const distSq2 = Math.pow(bLoc.x + 0.5 - loc.x, 2) + Math.pow(bLoc.y - loc.y, 2) + Math.pow(bLoc.z + 0.5 - loc.z, 2);
-              if (distSq2 < minDistanceSq) {
-                minDistanceSq = distSq2;
-                bestTablePos = bLoc;
-              }
-            }
-          } catch {
-          }
-        }
-      }
-    }
-    if (bestTablePos) {
-      if (existing?.isValid) {
-        const ep = existing.location;
-        if (Math.abs(ep.x - (bestTablePos.x + 0.5)) > 0.5 || Math.abs(ep.z - (bestTablePos.z + 0.5)) > 0.5 || Math.abs(ep.y - bestTablePos.y) > 0.5) {
-          try {
-            existing.teleport({
-              x: bestTablePos.x + 0.5,
-              y: bestTablePos.y,
-              z: bestTablePos.z + 0.5
-            });
-          } catch {
-          }
-        }
-      } else {
-        const tableCenter = {
-          x: bestTablePos.x + 0.5,
-          y: bestTablePos.y,
-          z: bestTablePos.z + 0.5
-        };
-        try {
-          const existingDummies = dim.getEntities({
-            location: tableCenter,
-            maxDistance: 1.5,
-            tags: ["mirage_enchant_dummy"]
-          });
-          if (existingDummies.length > 0) {
-            this.hitboxEntities.set(player.id, existingDummies[0]);
-          } else {
-            const entity = dim.spawnEntity(this.dummyEntityType, tableCenter);
-            entity.addTag("mirage_enchant_dummy");
-            this.hitboxEntities.set(player.id, entity);
-          }
-        } catch (e) {
-        }
-      }
-    } else {
-      if (existing?.isValid && existing.typeId === this.dummyEntityType) {
-        try {
-          existing.remove();
-        } catch {
-        }
-      }
-      this.hitboxEntities.delete(player.id);
     }
   }
   // --- Enchanting Table UI ---
   async openEnchantmentUI(player) {
-    const inventory = player.getComponent("minecraft:inventory").container;
-    let sharedRegistry = /* @__PURE__ */ new Map();
-    try {
-      const data = world35.getDynamicProperty("mirage:shared_registry");
-      if (data) {
-        const parsed = JSON.parse(data);
-        for (const key in parsed) {
-          sharedRegistry.set(key, parsed[key]);
-        }
-      }
-    } catch (e) {
-    }
-    if (sharedRegistry.size === 0) {
-      sharedRegistry = this.registry;
-    }
+    const isCreative = this.isCreative(player);
+    const inventory = player.getComponent("minecraft:inventory")?.container;
+    if (!inventory) return;
     const candidates = [];
     for (let i = 0; i < inventory.size; i++) {
       const item = inventory.getItem(i);
       if (!item) continue;
-      if (this.hasAnyApplicableEnchant(item, player, sharedRegistry)) {
-        candidates.push({ slot: i, item, source: "inv" });
+      if (this.hasAnyApplicableEnchant(item, player)) {
+        candidates.push({ slot: i, item });
       }
     }
-    if (candidates.length === 0) {
-      player.sendMessage("\xA7cNo enchantable items in your inventory. (" + sharedRegistry.size + " enchants registered)");
-      return;
-    }
-    const itemForm = new ActionFormData2().title("Custom Enchanting").body(`\xA77Select an item to enchant
-\xA77XP Level: ${player.level}`);
-    candidates.forEach((c) => {
-      const label = c.item.nameTag || c.item.typeId.split(":")[1];
-      itemForm.button(`${label}
-\xA78Slot ${c.slot}`);
-    });
-    system41.runTimeout(async () => {
-      try {
-        const itemResp = await itemForm.show(player);
-        if (itemResp.canceled) return;
-        const chosen = candidates[itemResp.selection];
-        const validEnchants = [];
-        const currentEnchants = this.getEnchantments(chosen.item);
-        for (const [id, config] of sharedRegistry) {
-          const isCompatible = config.appliesTo.some((type2) => chosen.item.typeId.includes(type2));
-          if (!isCompatible) continue;
-          const currentLevel = currentEnchants[id] || 0;
-          if (currentLevel >= config.maxLevel && player.getGameMode() !== GameMode5.Creative) continue;
-          const nextLevel = currentLevel + 1;
-          const cost = config._costMultiplier ? nextLevel * config._costMultiplier : typeof config.costPerLevel === "function" ? config.costPerLevel(nextLevel) : config.costPerLevel;
-          validEnchants.push({ config, nextLevel, cost });
-        }
-        if (validEnchants.length === 0) {
-          player.sendMessage("\xA7cNo available enchantments for this item (or maxed out).");
-          return;
-        }
-        const enchForm = new ActionFormData2().title("Select Enchantment").body(`\xA77Item: ${chosen.item.typeId.split(":")[1]}
-\xA77Available Enchants:`);
-        validEnchants.forEach(({ config, nextLevel, cost }) => {
-          enchForm.button(`\xA7d${config.name} ${nextLevel}
-\xA72Cost: ${cost} levels`);
+    const chosen = await new Promise((resolve) => {
+      const itemForm = new CustomForm(player, "\xA75\xA7lCustom Enchanting").header("\xA7d\xA7lSelect an Item to Enchant").spacer().label("\xA77Current Experience: \xA7e" + (player.level ?? 0) + " \xA77Levels").spacer().divider().spacer();
+      if (candidates.length === 0) {
+        itemForm.label("\xA7cNo enchantable items in your inventory.");
+        itemForm.label("\xA77Carry weapons, tools, or armor to apply custom enchantments.");
+      } else {
+        candidates.forEach((c) => {
+          const rawName = c.item.nameTag || c.item.typeId.replace("minecraft:", "").replace(/_/g, " ");
+          const capitalized = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+          const countText = c.item.amount > 1 ? ` (${c.item.amount}x)` : "";
+          itemForm.button(capitalized + countText + " (Slot " + (c.slot + 1) + ")", () => {
+            itemForm.close();
+            resolve(c);
+          });
         });
-        const enchResp = await enchForm.show(player);
-        if (enchResp.canceled) return;
-        const selected = validEnchants[enchResp.selection];
-        if (player.getGameMode() !== GameMode5.Creative && player.level < selected.cost) {
-          player.sendMessage("\xA7cNot enough experience levels!");
+      }
+      itemForm.spacer();
+      itemForm.closeButton();
+      itemForm.show().then(() => resolve(null)).catch((e) => console.error(e));
+    });
+    if (!chosen) return;
+    try {
+      const validEnchants = [];
+      const currentEnchants = this.getEnchantments(chosen.item);
+      for (const [id, config] of this.getAllAvailableEnchantments()) {
+        const isCompatible = this.isItemCompatible(chosen.item, config.appliesTo);
+        if (!isCreative && !isCompatible) continue;
+        const currentLevel = currentEnchants[id] || 0;
+        if (currentLevel >= config.maxLevel && !isCreative) continue;
+        if (!isCreative) {
+          const limitCheck = this.checkEnchantLimit(id, player);
+          if (limitCheck.blocked) continue;
+        }
+        const nextLevel = isCreative ? currentLevel >= config.maxLevel ? config.maxLevel : currentLevel + 1 : currentLevel + 1;
+        const cost = isCreative ? 0 : typeof config.costPerLevel === "function" ? config.costPerLevel(nextLevel) : config._costMultiplier ? nextLevel * config._costMultiplier : nextLevel * 3;
+        validEnchants.push({ config, nextLevel, cost, enchantId: id });
+      }
+      if (validEnchants.length === 0) {
+        player.sendMessage("\xA7cNo available enchantments for this item (maxed out or limit reached).");
+        return;
+      }
+      const chosenRawName = chosen.item.nameTag || chosen.item.typeId.replace("minecraft:", "").replace(/_/g, " ");
+      const chosenName = chosenRawName.charAt(0).toUpperCase() + chosenRawName.slice(1);
+      const selected = await new Promise((resolve) => {
+        const enchForm = new CustomForm(player, "\xA75\xA7lSelect Enchantment").header("\xA7d\xA7lItem: \xA7f" + chosenName).spacer().label("\xA77Current Experience: \xA7e" + (player.level ?? 0) + " \xA77Levels").spacer().divider().spacer();
+        const eco2 = this.getEconomy(player);
+        validEnchants.forEach((entry) => {
+          const { config, nextLevel, cost } = entry;
+          const costText = isCreative ? "Free" : eco2.type === "scoreboard" ? `${cost} ${eco2.objective}` : `${cost} Levels`;
+          enchForm.button(config.name + " " + this.toRoman(nextLevel) + " (" + costText + ")", () => {
+            enchForm.close();
+            resolve(entry);
+          });
+        });
+        enchForm.spacer();
+        enchForm.closeButton();
+        enchForm.show().then(() => resolve(null)).catch((e) => console.error(e));
+      });
+      if (!selected) return;
+      const currentInv = player.getComponent("minecraft:inventory")?.container;
+      if (!currentInv) return;
+      const targetItem = currentInv.getItem(chosen.slot);
+      if (!targetItem || targetItem.typeId !== chosen.item.typeId) {
+        player.sendMessage("\xA7cInventory changed. Transaction cancelled.");
+        return;
+      }
+      const eco = this.getEconomy(player);
+      let pScore = 0;
+      if (eco.type === "scoreboard" && !isCreative) {
+        try {
+          pScore = world31.scoreboard.getObjective(eco.objective)?.getScore(player) || 0;
+        } catch (e) {
+        }
+        if (pScore < selected.cost) {
+          player.sendMessage(`\xA7cNot enough ${eco.objective}! Need ${selected.cost}.`);
+          player.playSound("note.bass");
           return;
         }
-        const applyData = {
-          enchantId: selected.config.id,
-          level: selected.nextLevel,
-          cost: selected.cost,
-          slot: chosen.slot,
-          itemTypeId: chosen.item.typeId
-        };
-        player.runCommand(`scriptevent mirage:apply_enchant ${JSON.stringify(applyData)}`);
-      } catch (e) {
+      } else if (eco.type !== "scoreboard" && !isCreative) {
+        if ((player.level ?? 0) < selected.cost) {
+          player.sendMessage(`\xA7cNot enough XP! Need ${selected.cost} levels.`);
+          player.playSound("note.bass");
+          return;
+        }
       }
-    });
-  }
-  /**
-   * Returns true if the item can receive at least one registered enchant.
-   */
-  hasAnyApplicableEnchant(item, player, customRegistry = null) {
-    const currentEnchants = this.getEnchantments(item);
-    const reg = customRegistry || this.registry;
-    for (const [id, config] of reg) {
-      const isCompatible = config.appliesTo.some((type2) => item.typeId.includes(type2));
-      if (!isCompatible) continue;
-      const currentLevel = currentEnchants[id] || 0;
-      if (currentLevel < config.maxLevel || player?.getGameMode() === GameMode5.Creative) return true;
+      if (!isCreative) {
+        const finalCheck = this.checkEnchantLimit(selected.enchantId, player);
+        if (finalCheck.blocked) {
+          player.sendMessage(finalCheck.reason);
+          player.playSound("note.bass");
+          return;
+        }
+      }
+      let newItem;
+      if (targetItem.amount > 1) {
+        const singleItem = targetItem.clone();
+        singleItem.amount = 1;
+        newItem = this.applyEnchantment(singleItem, selected.config.id, selected.nextLevel);
+        targetItem.amount--;
+        currentInv.setItem(chosen.slot, targetItem);
+        const added = currentInv.addItem(newItem);
+        if (added) {
+          player.dimension.spawnItem(newItem, player.location);
+        }
+      } else {
+        newItem = this.applyEnchantment(targetItem, selected.config.id, selected.nextLevel);
+        currentInv.setItem(chosen.slot, newItem);
+        const equip = player.getComponent("minecraft:equippable");
+        const currentMainHand = equip?.getEquipment(EquipmentSlot7.Mainhand);
+        if (currentMainHand && currentMainHand.typeId === newItem.typeId) {
+          equip.setEquipment(EquipmentSlot7.Mainhand, newItem);
+        }
+      }
+      if (!isCreative) {
+        if (eco.type === "scoreboard") {
+          try {
+            world31.scoreboard.getObjective(eco.objective)?.addScore(player, -selected.cost);
+          } catch (e) {
+          }
+        } else {
+          player.addLevels(-selected.cost);
+        }
+        this.incrementEnchantCount(selected.enchantId, player);
+      }
+      player.dimension.spawnParticle("minecraft:enchanting_table_particle", player.location);
+      player.playSound("random.levelup");
+      player.sendMessage(`\xA7aSuccessfully enchanted with ${selected.config.name} ${this.toRoman(selected.nextLevel)}!`);
+    } catch (e) {
+      console.warn("[EnchantmentLib] Error in enchanting flow: " + e);
     }
-    return false;
-  }
-  applyEnchantmentTransaction(player, itemStack, selection) {
-    const { config, nextLevel, cost } = selection;
-    if (player.level < cost && player.getGameMode() !== GameMode5.Creative) {
-      player.sendMessage(`\xA7cNot enough XP! Need ${cost} levels.`);
-      player.playSound("note.bass");
-      return;
-    }
-    const newItem = this.applyEnchantment(itemStack, config.id, nextLevel);
-    const equippable = player.getComponent("minecraft:equippable");
-    equippable.setEquipment("Mainhand", newItem);
-    if (player.getGameMode() !== GameMode5.Creative) {
-      player.addLevels(-cost);
-    }
-    player.dimension.playSound("random.levelup", player.location);
-    player.sendMessage(`\xA7aEnchanted with ${config.name} ${this.toRoman(nextLevel)}!`);
   }
   // --- Anvil UI ---
   async openAnvilBookApplyUI(player, bookStack, enchantId) {
-    const config = this.registry.get(enchantId);
+    const isCreative = this.isCreative(player);
+    const cleanId = this.cleanId(enchantId);
+    const config = this.get(cleanId);
     if (!config) return;
-    const inventory = player.getComponent("minecraft:inventory").container;
+    const inventory = player.getComponent("minecraft:inventory")?.container;
+    if (!inventory) return;
     const validTargets = [];
     for (let i = 0; i < inventory.size; i++) {
       const item = inventory.getItem(i);
       if (!item) continue;
-      const isCompatible = config.appliesTo.some((type2) => item.typeId.includes(type2));
+      const isCompatible = this.isItemCompatible(item, config.appliesTo);
       const currentEnchants = this.getEnchantments(item);
-      const currentLevel = currentEnchants[enchantId] || 0;
-      if (isCompatible && (currentLevel < config.maxLevel || player.getGameMode() === GameMode5.Creative)) {
+      const currentLevel = currentEnchants[cleanId] || 0;
+      if (isCreative || isCompatible && currentLevel < config.maxLevel) {
         validTargets.push({
           slot: i,
           item,
-          nextLevel: currentLevel + 1,
-          cost: typeof config.costPerLevel === "function" ? config.costPerLevel(currentLevel + 1) : config.costPerLevel
+          nextLevel: isCreative ? currentLevel >= config.maxLevel ? config.maxLevel : currentLevel + 1 : currentLevel + 1,
+          cost: isCreative ? 0 : typeof config.costPerLevel === "function" ? config.costPerLevel(currentLevel + 1) : config._costMultiplier ? (currentLevel + 1) * config._costMultiplier : 3
         });
       }
     }
@@ -17579,74 +11842,128 @@ var EnchantmentManager = class {
       player.sendMessage(`\xA7cNo compatible items for ${config.name} found in your inventory.`);
       return;
     }
-    const form = new ActionFormData2().title(`Combine: ${config.name}`).body(`\xA77Select an item to apply the enchantment to:`);
-    validTargets.forEach((t) => {
-      const color = player.level >= t.cost ? "\xA72" : "\xA7c";
-      const itemName = t.item.nameTag || t.item.typeId.split(":")[1];
-      form.button(`${itemName} (Slot ${t.slot})
-${color}Cost: ${t.cost} Lvl`);
+    const eco = this.getEconomy(player);
+    const selection = await new Promise((resolve) => {
+      const form = new CustomForm(player, "\xA76\xA7lAnvil: \xA7f" + config.name).header("\xA7e\xA7lSelect Target Item").spacer().label("\xA77Select an item to combine with \xA7d" + config.name + "\xA77.\n\xA77Current Experience: \xA7e" + (player.level ?? 0) + " \xA77Levels").spacer().divider().spacer();
+      validTargets.forEach((t) => {
+        const rawName = t.item.nameTag || t.item.typeId.replace("minecraft:", "").replace(/_/g, " ");
+        const capitalized = rawName.charAt(0).toUpperCase() + rawName.slice(1);
+        const costText = isCreative ? "Free" : eco.type === "scoreboard" ? `${t.cost} ${eco.objective}` : `${t.cost} Levels`;
+        form.button(capitalized + " (Slot " + (t.slot + 1) + ") - " + costText, () => {
+          form.close();
+          resolve(t);
+        });
+      });
+      form.spacer();
+      form.closeButton();
+      form.show().then(() => resolve(null)).catch((e) => console.error(e));
     });
-    const response = await form.show(player);
-    if (response.canceled) return;
-    const selection = validTargets[response.selection];
+    if (!selection) return;
     const currentInvItem = inventory.getItem(selection.slot);
-    const currentHandItem = player.getComponent("minecraft:equippable").getEquipment("Mainhand");
+    const equipComp = player.getComponent("minecraft:equippable");
+    const currentHandItem = equipComp?.getEquipment(EquipmentSlot7.Mainhand);
     if (!currentHandItem || currentHandItem.typeId !== bookStack.typeId || !currentInvItem || currentInvItem.typeId !== selection.item.typeId) {
       player.sendMessage("\xA7cInventory changed. Transaction cancelled.");
       return;
     }
-    if (player.level < selection.cost && player.getGameMode() !== GameMode5.Creative) {
-      player.sendMessage(`\xA7cNot enough XP! Need ${selection.cost} levels.`);
-      player.playSound("note.bass");
-      return;
+    let pScore = 0;
+    if (eco.type === "scoreboard" && !isCreative) {
+      try {
+        pScore = world31.scoreboard.getObjective(eco.objective)?.getScore(player) || 0;
+      } catch (e) {
+      }
+      if (pScore < selection.cost) {
+        player.sendMessage(`\xA7cNot enough ${eco.objective}! Need ${selection.cost}.`);
+        player.playSound("note.bass");
+        return;
+      }
+    } else if (eco.type !== "scoreboard" && !isCreative) {
+      if ((player.level ?? 0) < selection.cost) {
+        player.sendMessage(`\xA7cNot enough XP! Need ${selection.cost} levels.`);
+        player.playSound("note.bass");
+        return;
+      }
     }
     const newItem = this.applyEnchantment(currentInvItem, config.id, selection.nextLevel);
     inventory.setItem(selection.slot, newItem);
     if (currentHandItem.amount > 1) {
       currentHandItem.amount--;
-      player.getComponent("minecraft:equippable").setEquipment("Mainhand", currentHandItem);
+      equipComp.setEquipment(EquipmentSlot7.Mainhand, currentHandItem);
     } else {
-      player.getComponent("minecraft:equippable").setEquipment("Mainhand");
+      equipComp.setEquipment(EquipmentSlot7.Mainhand, void 0);
     }
-    if (player.getGameMode() !== GameMode5.Creative) {
-      player.addLevels(-selection.cost);
+    if (!isCreative) {
+      if (eco.type === "scoreboard") {
+        try {
+          world31.scoreboard.getObjective(eco.objective)?.addScore(player, -selection.cost);
+        } catch (e) {
+        }
+      } else {
+        player.addLevels(-selection.cost);
+      }
+      this.incrementEnchantCount(cleanId, player);
     }
     player.playSound("random.anvil_use");
     player.dimension.spawnParticle("minecraft:villager_happy", player.location);
     player.sendMessage(`\xA7aSuccessfully combined ${config.name} with your item!`);
   }
   // --- Helper Methods ---
-  applyEnchantment(itemStack, id, level) {
-    const config = this.registry.get(id);
-    if (!config) return itemStack;
+  /**
+   * Applies an enchantment to an item stack with indestructible lore and fake glint.
+   * @param {ItemStack} itemStack
+   * @param {string} id
+   * @param {number} level
+   * @param {Object} [customConfig]
+   * @returns {ItemStack}
+   */
+  applyEnchantment(itemStack, id, level = 1, customConfig = null) {
+    if (!itemStack) return itemStack;
+    const cleanId = this.cleanId(id);
+    const config = customConfig || this.get(cleanId) || { id: cleanId, name: cleanId, maxLevel: 5 };
     const enchants = this.getEnchantments(itemStack);
-    enchants[id] = level;
-    itemStack.setDynamicProperty("mirage:enchants", JSON.stringify(enchants));
-    const currentLore = itemStack.getLore() || [];
+    enchants[cleanId] = level;
+    try {
+      const serialized = JSON.stringify(enchants);
+      itemStack.setDynamicProperty("mirage:enchants", serialized);
+      itemStack.setDynamicProperty("luminiae:enchants", serialized);
+      itemStack.setDynamicProperty("tme:enchants", serialized);
+      itemStack.setDynamicProperty("ench:enchants", serialized);
+    } catch (e) {
+    }
+    const currentLore = itemStack.getLore ? itemStack.getLore() || [] : [];
     const newLoreLine = `\xA77${config.name} ${this.toRoman(level)}`;
-    const cleanLore = currentLore.filter((line) => !line.includes(`\xA77${config.name}`));
+    const cleanLore = currentLore.filter((line) => {
+      if (typeof line !== "string") return false;
+      const cleanText = line.replace(/§./g, "").trim().toLowerCase();
+      return !cleanText.startsWith(config.name.toLowerCase());
+    });
     cleanLore.unshift(newLoreLine);
-    itemStack.setLore(cleanLore);
-    this.updateGlint(itemStack);
+    if (itemStack.setLore) {
+      itemStack.setLore(cleanLore);
+    }
+    this.updateGlint(itemStack, true);
     return itemStack;
   }
   /**
-   * Toggles the dummy glint based on context.
+   * Toggles fake purple glint spoofing on an item.
+   * @param {ItemStack} itemStack
+   * @param {boolean} shouldHaveGlint
    */
   updateGlint(itemStack, shouldHaveGlint = true) {
+    if (!itemStack) return;
     const enchantable = itemStack.getComponent("minecraft:enchantable");
     if (!enchantable) return;
-    const hasDummy = itemStack.getDynamicProperty("mirage:dummy_glint");
+    const hasDummy = itemStack.getDynamicProperty("mirage:dummy_glint") || itemStack.getDynamicProperty("luminiae:dummy_glint") || itemStack.getDynamicProperty("tme:dummy_glint") || itemStack.getDynamicProperty("ench:dummy_glint");
     const currentVanillas = enchantable.getEnchantments();
     if (shouldHaveGlint) {
       if (currentVanillas.length === 0) {
         try {
           enchantable.addEnchantment({ type: "unbreaking", level: 0 });
-          itemStack.setDynamicProperty("mirage:dummy_glint", true);
+          this.setDummyGlintProperty(itemStack, true);
         } catch (e) {
           try {
             enchantable.addEnchantment({ type: "unbreaking", level: 1 });
-            itemStack.setDynamicProperty("mirage:dummy_glint", true);
+            this.setDummyGlintProperty(itemStack, true);
           } catch (e2) {
           }
         }
@@ -17656,32 +11973,49 @@ ${color}Cost: ${t.cost} Lvl`);
         const unbreaking = enchantable.getEnchantment("unbreaking");
         if (unbreaking && currentVanillas.length === 1) {
           enchantable.removeAllEnchantments();
-          itemStack.setDynamicProperty("mirage:dummy_glint", void 0);
+          this.setDummyGlintProperty(itemStack, void 0);
         }
       }
     }
   }
+  setDummyGlintProperty(itemStack, value) {
+    try {
+      itemStack.setDynamicProperty("mirage:dummy_glint", value);
+      itemStack.setDynamicProperty("luminiae:dummy_glint", value);
+      itemStack.setDynamicProperty("tme:dummy_glint", value);
+      itemStack.setDynamicProperty("ench:dummy_glint", value);
+    } catch (e) {
+    }
+  }
+  hasDummyGlint(itemStack) {
+    if (!itemStack || !itemStack.getDynamicProperty) return false;
+    try {
+      return !!(itemStack.getDynamicProperty("mirage:dummy_glint") || itemStack.getDynamicProperty("luminiae:dummy_glint") || itemStack.getDynamicProperty("tme:dummy_glint") || itemStack.getDynamicProperty("ench:dummy_glint"));
+    } catch (e) {
+      return false;
+    }
+  }
   /**
-   * Scans players to toggle glint state.
+   * Scans players every 5 ticks to suppress glint in cursor slots and maintain glint in inventory.
    */
   manageVisuals() {
-    for (const player of world35.getAllPlayers()) {
+    for (const player of world31.getAllPlayers()) {
+      if (!player.isValid) continue;
       const cursorComp = player.getComponent("minecraft:cursor_inventory");
-      if (cursorComp && cursorComp.item) {
-        const item = cursorComp.item;
-        if (this.hasCustomEnchants(item) && item.getDynamicProperty("mirage:dummy_glint")) {
-          this.updateGlint(item, false);
-          cursorComp.item = item;
+      if (cursorComp?.item && this.hasCustomEnchants(cursorComp.item)) {
+        if (this.hasDummyGlint(cursorComp.item)) {
+          this.updateGlint(cursorComp.item, false);
+          cursorComp.item = cursorComp.item;
         }
       }
       const invComp = player.getComponent("minecraft:inventory");
-      if (invComp && invComp.container) {
+      if (invComp?.container) {
         const container = invComp.container;
         for (let i = 0; i < container.size; i++) {
           const item = container.getItem(i);
-          if (item && this.hasCustomEnchants(item) && !item.getDynamicProperty("mirage:dummy_glint")) {
+          if (item && this.hasCustomEnchants(item) && !this.hasDummyGlint(item)) {
             this.updateGlint(item, true);
-            if (item.getDynamicProperty("mirage:dummy_glint")) {
+            if (this.hasDummyGlint(item)) {
               container.setItem(i, item);
             }
           }
@@ -17689,12 +12023,19 @@ ${color}Cost: ${t.cost} Lvl`);
       }
       const equipComp = player.getComponent("minecraft:equippable");
       if (equipComp) {
-        const slots = ["Mainhand", "Offhand", "Head", "Chest", "Legs", "Feet"];
+        const slots = [
+          EquipmentSlot7.Mainhand,
+          EquipmentSlot7.Offhand,
+          EquipmentSlot7.Head,
+          EquipmentSlot7.Chest,
+          EquipmentSlot7.Legs,
+          EquipmentSlot7.Feet
+        ];
         for (const slot of slots) {
           const item = equipComp.getEquipment(slot);
-          if (item && this.hasCustomEnchants(item) && !item.getDynamicProperty("mirage:dummy_glint")) {
+          if (item && this.hasCustomEnchants(item) && !this.hasDummyGlint(item)) {
             this.updateGlint(item, true);
-            if (item.getDynamicProperty("mirage:dummy_glint")) {
+            if (this.hasDummyGlint(item)) {
               equipComp.setEquipment(slot, item);
             }
           }
@@ -17702,28 +12043,165 @@ ${color}Cost: ${t.cost} Lvl`);
       }
     }
   }
+  /**
+   * Checks if an item stack has any custom enchantments.
+   * @param {ItemStack} item
+   * @returns {boolean}
+   */
   hasCustomEnchants(item) {
-    return !!item.getDynamicProperty("mirage:enchants");
+    if (!item) return false;
+    const lore = item.getLore ? item.getLore() : [];
+    if (lore && lore.length > 0) {
+      return lore.some((line) => typeof line === "string" && (line.startsWith("\xA77") || line.includes("\xA77")));
+    }
+    const type2 = (item.typeId || "").toLowerCase();
+    if (type2.includes("enchanted_book_")) return true;
+    try {
+      if (item.getDynamicProperty && (item.getDynamicProperty("mirage:enchants") || item.getDynamicProperty("luminiae:enchants") || item.getDynamicProperty("tme:enchants") || item.getDynamicProperty("ench:enchants"))) {
+        return true;
+      }
+    } catch (e) {
+    }
+    return false;
   }
+  /**
+   * Checks whether an item stack possesses a specific custom enchantment.
+   * @param {ItemStack} itemStack
+   * @param {string} id
+   * @returns {boolean}
+   */
+  hasEnchantment(itemStack, id) {
+    if (!itemStack || !id) return false;
+    const clean = this.cleanId(id);
+    const enchants = this.getEnchantments(itemStack);
+    return typeof enchants[clean] === "number" && enchants[clean] > 0;
+  }
+  /**
+   * Returns the level of a specific custom enchantment on an item stack (0 if absent).
+   * @param {ItemStack} itemStack
+   * @param {string} id
+   * @returns {number}
+   */
+  getEnchantLevel(itemStack, id) {
+    if (!itemStack || !id) return 0;
+    const clean = this.cleanId(id);
+    const enchants = this.getEnchantments(itemStack);
+    return enchants[clean] || 0;
+  }
+  /**
+   * Retrieves all custom enchantments on an item stack as a dictionary: { [cleanId]: level }.
+   * Prioritizes indestructible lore parsing with physical book and dynamic property fallbacks.
+   * @param {ItemStack} itemStack
+   * @returns {Object<string, number>}
+   */
   getEnchantments(itemStack) {
     if (!itemStack) return {};
-    const data = itemStack.getDynamicProperty("mirage:enchants");
-    if (!data) return {};
+    const lore = itemStack.getLore ? itemStack.getLore() : [];
+    if (lore && lore.length > 0) {
+      const result = {};
+      const allEnchants = this.getAllAvailableEnchantments();
+      const sortedAvailable = Array.from(allEnchants.entries()).sort(
+        (a, b) => (b[1]?.name?.length || 0) - (a[1]?.name?.length || 0)
+      );
+      for (const line of lore) {
+        if (typeof line !== "string") continue;
+        const clean = line.replace(/§./g, "").trim();
+        if (!clean) continue;
+        const lowerClean = clean.toLowerCase();
+        for (const [id, config] of sortedAvailable) {
+          const targetName = (config.name || "").toLowerCase();
+          if (targetName && lowerClean.startsWith(targetName)) {
+            const cleanId = this.cleanId(id);
+            const suffix = clean.substring(config.name.length).trim();
+            if (suffix !== "" && !/^[IVXLCDM]+$/i.test(suffix)) {
+              continue;
+            }
+            const level = suffix === "" ? 1 : this.fromRoman(suffix) || 1;
+            const candidates = [];
+            for (const [candId, candCfg] of allEnchants) {
+              if ((candCfg.name || "").toLowerCase() === targetName) {
+                candidates.push({ id: this.cleanId(candId), config: candCfg });
+              }
+            }
+            if (candidates.length > 1 && itemStack.typeId) {
+              const matched = candidates.find((c) => this.isItemCompatible(itemStack, c.config.appliesTo)) || candidates[0];
+              result[matched.id] = level;
+            } else {
+              result[cleanId] = level;
+            }
+            break;
+          }
+        }
+      }
+      if (Object.keys(result).length > 0) return result;
+    }
+    if (itemStack.typeId) {
+      const rawType = itemStack.typeId.toLowerCase();
+      const cleanType = this.cleanId(rawType);
+      if (cleanType.includes("enchanted_book_")) {
+        const bookSuffix = cleanType.replace("enchanted_book_", "");
+        const match = bookSuffix.match(/^(.+)_(\d+)$/);
+        if (match) {
+          const cleanId = this.cleanId(match[1]);
+          return { [cleanId]: parseInt(match[2], 10) || 1 };
+        } else {
+          const cleanId = this.cleanId(bookSuffix);
+          return { [cleanId]: 1 };
+        }
+      }
+    }
     try {
-      return JSON.parse(data);
+      if (itemStack.getDynamicProperty) {
+        const data = itemStack.getDynamicProperty("mirage:enchants") || itemStack.getDynamicProperty("luminiae:enchants") || itemStack.getDynamicProperty("tme:enchants") || itemStack.getDynamicProperty("ench:enchants");
+        if (data && typeof data === "string") {
+          const parsed = JSON.parse(data);
+          if (parsed && typeof parsed === "object") {
+            const cleanParsed = {};
+            for (const [k, v] of Object.entries(parsed)) {
+              cleanParsed[this.cleanId(k)] = v;
+            }
+            return cleanParsed;
+          }
+        }
+      }
     } catch (e) {
-      return {};
     }
+    return {};
   }
-  toRoman(num) {
-    const roman = { M: 1e3, CM: 900, D: 500, CD: 400, C: 100, XC: 90, L: 50, XL: 40, X: 10, IX: 9, V: 5, IV: 4, I: 1 };
-    let str = "";
-    for (let i of Object.keys(roman)) {
-      let q = Math.floor(num / roman[i]);
-      num -= q * roman[i];
-      str += i.repeat(q);
+  /**
+   * Converts a Roman numeral string to an integer.
+   * @param {string} str
+   * @returns {number}
+   */
+  fromRoman(str) {
+    if (!str || typeof str !== "string") return 1;
+    const upper = str.toUpperCase().trim();
+    const map = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1e3 };
+    let result = 0;
+    for (let i = 0; i < upper.length; i++) {
+      const curr = map[upper[i]] || 0;
+      const next = map[upper[i + 1]] || 0;
+      result += curr < next ? -curr : curr;
     }
-    return str;
+    return result || 1;
+  }
+  /**
+   * Converts an integer to a Roman numeral string.
+   * @param {number} num
+   * @returns {string}
+   */
+  toRoman(num) {
+    const n = Math.floor(Number(num));
+    if (isNaN(n) || n <= 0) return "I";
+    const roman = { M: 1e3, CM: 900, D: 500, CD: 400, C: 100, XC: 90, L: 50, XL: 40, X: 10, IX: 9, V: 5, IV: 4, I: 1 };
+    let remaining = n;
+    let str = "";
+    for (const [r, val] of Object.entries(roman)) {
+      const q = Math.floor(remaining / val);
+      remaining -= q * val;
+      str += r.repeat(q);
+    }
+    return str || "I";
   }
 };
 var enchantmentManager = new EnchantmentManager();
@@ -17759,7 +12237,7 @@ enchantmentManager.register("gaia:thunder_strike", {
 });
 
 // src/main/bedrock/ts/entities/MalachiteGuard.ts
-import { world as world36, system as system42, EquipmentSlot as EquipmentSlot8, GameMode as GameMode6, EntityComponentTypes, EntityDamageCause } from "@minecraft/server";
+import { world as world32, system as system37, EquipmentSlot as EquipmentSlot8, GameMode as GameMode6, EntityComponentTypes, EntityDamageCause } from "@minecraft/server";
 var GUARD_ID = "gaiadimension:malachite_guard";
 var DRONE_ID = "gaiadimension:malachite_drone";
 var BATON_ID = "gaiadimension:malachite_guard_baton";
@@ -17841,13 +12319,13 @@ var MalachiteGuardSystem = class {
     this.init();
   }
   init() {
-    world36.afterEvents.entitySpawn.subscribe((event) => {
+    world32.afterEvents.entitySpawn.subscribe((event) => {
       const { entity } = event;
       if (entity.typeId === GUARD_ID) {
         this.setupGuard(entity);
       }
     });
-    system42.runInterval(() => {
+    system37.runInterval(() => {
       for (const dimension of getDimensions()) {
         const guards = dimension.getEntities({ type: GUARD_ID });
         for (const guard of guards) {
@@ -17859,7 +12337,7 @@ var MalachiteGuardSystem = class {
         }
       }
     }, 1);
-    world36.afterEvents.entityHurt.subscribe((event) => {
+    world32.afterEvents.entityHurt.subscribe((event) => {
       const { hurtEntity, damage, damageSource } = event;
       if (hurtEntity.typeId !== GUARD_ID || !hurtEntity.isValid) return;
       const phase = getNum(hurtEntity, P.PHASE, 0 /* Defence */);
@@ -17875,7 +12353,7 @@ var MalachiteGuardSystem = class {
       }
       if (phase === 0 /* Defence */) {
         if (damage > 0) {
-          system42.run(() => {
+          system37.run(() => {
             try {
               if (hurtEntity.isValid && health) {
                 health.setCurrentValue(Math.min(curHp + damage, maxHp));
@@ -17889,7 +12367,7 @@ var MalachiteGuardSystem = class {
       if (phase === 1 /* Attack */) {
         const threshold = maxHp / 2 - 2;
         if (curHp < threshold) {
-          system42.run(() => {
+          system37.run(() => {
             try {
               if (hurtEntity.isValid && health) {
                 health.setCurrentValue(threshold);
@@ -17903,7 +12381,7 @@ var MalachiteGuardSystem = class {
       if (phase === 2 /* Resist */) {
         if (!playerAttacker) {
           if (hurtEntity.location.y > -64) {
-            system42.run(() => {
+            system37.run(() => {
               try {
                 if (hurtEntity.isValid && health) {
                   health.setCurrentValue(Math.min(curHp + damage, maxHp));
@@ -17917,7 +12395,7 @@ var MalachiteGuardSystem = class {
         const mult = getDamageMultiplier(damage);
         if (mult < 1) {
           const reduction = damage * (1 - mult);
-          system42.run(() => {
+          system37.run(() => {
             try {
               if (hurtEntity.isValid && health) {
                 health.setCurrentValue(Math.min(curHp + reduction, maxHp));
@@ -17928,7 +12406,7 @@ var MalachiteGuardSystem = class {
         }
       }
     });
-    world36.afterEvents.entityHitEntity.subscribe((event) => {
+    world32.afterEvents.entityHitEntity.subscribe((event) => {
       const { damagingEntity, hitEntity } = event;
       if (isValidPlayer(damagingEntity) && hitEntity.isValid) {
         try {
@@ -17956,7 +12434,7 @@ var MalachiteGuardSystem = class {
           if (item) {
             const dim = hitEntity.dimension;
             const loc = hitEntity.location;
-            system42.run(() => {
+            system37.run(() => {
               try {
                 dim.spawnItem(item, { x: loc.x, y: loc.y + 0.5, z: loc.z });
                 equip.setEquipment(slot, void 0);
@@ -17969,7 +12447,7 @@ var MalachiteGuardSystem = class {
         }
       }
     });
-    world36.afterEvents.entityDie.subscribe((event) => {
+    world32.afterEvents.entityDie.subscribe((event) => {
       const { deadEntity } = event;
       if (deadEntity.typeId !== DRONE_ID) return;
       const parentId = getStr(deadEntity, P.PARENT_ID);
@@ -17991,7 +12469,7 @@ var MalachiteGuardSystem = class {
     setNum(guard, P.BIDE_DAMAGE, 0);
     setBool(guard, P.HAS_DRONES, true);
     setBool(guard, P.DRONES_SPAWNED, false);
-    system42.run(() => {
+    system37.run(() => {
       if (!guard.isValid) return;
       try {
         guard.triggerEvent("mg_defend");
@@ -18163,7 +12641,7 @@ var MalachiteGuardSystem = class {
         dim.runCommand(`particle minecraft:terrain_explosion ${gl.x} ${gl.y} ${gl.z}`);
       } catch {
       }
-      system42.runTimeout(() => {
+      system37.runTimeout(() => {
         if (!guard.isValid) return;
         setNum(guard, P.STOMP_COOLDOWN, STOMP_COOLDOWN);
         guard.triggerEvent("mg_stomp_end");
@@ -18254,7 +12732,7 @@ var malachiteGuardSystem = new MalachiteGuardSystem();
 // src/main/bedrock/ts/GaiaDimensionAddon.ts
 initializeDestructionHandlers();
 initializeEventManager();
-system43.beforeEvents?.shutdown?.subscribe((event) => event.cancel = true);
+system38.beforeEvents?.shutdown?.subscribe((event) => event.cancel = true);
 initializeScriptEvents();
 initializeGeyser();
 initializeLightMixin();
@@ -18262,11 +12740,13 @@ initializeGlitterGrassSync();
 initializeMagicStaffBehaviors();
 registerCustomTool();
 initDestroyedDimensionGuard();
-system43.beforeEvents.startup.subscribe((event) => {
+initializeGaiaChunkCoordinator();
+system38.beforeEvents.startup.subscribe((event) => {
   const { blockComponentRegistry, customCommandRegistry, itemComponentRegistry, dimensionRegistry } = event;
   const gaiaDimId = "gaiadimension:gaia_dimension";
   dimensionRegistry.registerCustomDimension(gaiaDimId);
   registerDimension(gaiaDimId);
+  initializeGaiaChunkCoordinator();
   registerRealmDimensions(dimensionRegistry);
   for (let i = 0; i < REALM_COUNT; i++) {
     registerDimension(`${REALM_PREFIX}${i}`);
@@ -18296,39 +12776,4 @@ system43.beforeEvents.startup.subscribe((event) => {
   registerSetBiomeCommand(customCommandRegistry);
   registerDestructionCommands(customCommandRegistry);
 });
-/*! Bundled license information:
-
-fastnoise-lite/FastNoiseLite.js:
-  (**
-   * @description FastNoise Lite is an extremely portable open source noise generation library with a large selection of noise algorithms
-   * @author Jordan Peck, snowfoxsh
-   * @version 1.1.0
-   * @copyright Copyright(c) 2023 Jordan Peck, Contributors
-   * @license MIT
-   * @git https://github.com/Auburn/FastNoiseLite
-   * @npm https://www.npmjs.com/package/fastnoise-lite
-   * @example
-  // Import from npm (if you used npm)
-  
-  import FastNoiseLite from "fastnoise-lite";
-  
-  // Create and configure FastNoiseLite object
-  
-  let noise = new FastNoiseLite();
-  noise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
-  
-  // Gather noise data
-  let noiseData = [];
-  
-  for (let x = 0; x < 128; x++) {
-      noiseData[x] = [];
-  
-      for (let y = 0; y < 128; y++) {        
-          noiseData[x][y] = noise.GetNoise(x,y);
-      }
-  }
-  
-  // Do something with this data...
-   *)
-*/
 //# sourceMappingURL=GaiaDimensionAddon.js.map

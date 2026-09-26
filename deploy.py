@@ -8,12 +8,12 @@ import sys
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Source Project Folders
-BP_PATH = "data"
-RP_PATH = "resources"
+BP_PATH = os.path.join("src", "main", "bedrock", "data")
+RP_PATH = os.path.join("src", "main", "bedrock", "resources")
 
 # Updated Mojang Folder Configuration
-appdata = os.environ.get('APPDATA', r"C:\Users\ADMIN\AppData\Roaming")
-MOJANG_DIR = os.path.join(appdata, "Minecraft Bedrock", "Users", "Shared", "games", "com.mojang")
+APPDATA = os.environ.get("APPDATA", r"C:\Users\OS\AppData\Roaming")
+MOJANG_DIR = os.path.join(APPDATA, "Minecraft Bedrock", "Users", "Shared", "games", "com.mojang")
 
 DEV_BP_DIR = os.path.join(MOJANG_DIR, 'development_behavior_packs', 'GaiaDimensions_BP')
 DEV_RP_DIR = os.path.join(MOJANG_DIR, 'development_resource_packs', 'GaiaDimension_RP')

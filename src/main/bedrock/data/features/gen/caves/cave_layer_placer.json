@@ -5,9 +5,9 @@
 			"identifier": "gaiadimension:gen/caves/cave_layer_placer"
 		},
 		"places_feature": "flakey:gen/blocks/air",
-		"iterations": "v.y = 5; v.f = q.noise(v.worldx * 0.01 + 100, v.worldz * 0.01 + 200) * 20 + 15; v.h = q.noise(v.worldx * 0.01, v.worldz * 0.01) * 30 + 1; return 100;",
-		"x": "return (v.y >= v.f && v.y <= (v.f + v.h)) ? 0 : 1000;",
+		"iterations": "v.cy = 4; return 116;",
+		"x": "v.cy = v.cy + 1; v.n_chasm = q.noise(v.worldx * 0.02 + 731.3, v.worldz * 0.02 + 912.7) * 0.6 + q.noise(v.worldx * 0.02 + 731.3, v.cy * 0.05) * 0.2 + q.noise(v.worldz * 0.02 + 912.7, v.cy * 0.05) * 0.2; v.ny_chasm = q.noise(v.worldx * 0.02 + 731.3, v.cy * 0.05) * 0.5 + q.noise(v.worldz * 0.02 + 912.7, v.cy * 0.05) * 0.5; v.carve_chasm = (v.cy >= 5 && v.cy <= 24 && v.n_chasm > 0.22 && v.ny_chasm > -0.7); v.n_cave = q.noise(v.worldx * 0.04 + 128.5, v.worldz * 0.04 + 256.5) * 0.5 + q.noise(v.worldx * 0.04 + 128.5, v.cy * 0.08) * 0.25 + q.noise(v.worldz * 0.04 + 256.5, v.cy * 0.08) * 0.25; v.ny_cave = q.noise(v.worldx * 0.04 + 128.5, v.cy * 0.08) * 0.5 + q.noise(v.worldz * 0.04 + 256.5, v.cy * 0.08) * 0.5; v.carve_cave = (v.cy >= 10 && v.cy <= 120 && v.n_cave > 0.42 && v.ny_cave > -0.7); return (v.carve_chasm || v.carve_cave) ? 0 : 1000;",
 		"z": 0,
-		"y": "v.y = v.y + 1; return v.y;"
+		"y": "return v.cy;"
 	}
 }

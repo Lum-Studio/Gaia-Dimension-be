@@ -5,14 +5,14 @@
 			"identifier": "gaiadimension:gen/caves/magma_placer"
 		},
 		"places_feature": "gaiadimension:gen/blocks/magma",
-		"iterations": "return 7;",
+		"iterations": 10,
 		"x": 0,
 		"z": 0,
 		"y": {
 			"distribution": "fixed_grid",
 			"extent": [
-				"1",
-				"7"
+				1,
+				10
 			]
 		}
 	}

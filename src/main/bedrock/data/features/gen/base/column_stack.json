@@ -5,14 +5,14 @@
             "identifier": "gaiadimension:gen/base/column_stack"
         },
         "places_feature": "gaiadimension:gen/base/block_picker",
-        "iterations": "math.max(t.height,63) + 1",
+        "iterations": "math.max(t.height, 63) + 1",
         "x": 0,
         "z": "t.layer = t.layer + 1; return 0;",
         "y": {
             "distribution": "fixed_grid",
             "extent": [
                 0,
-                "math.max(t.height,63)"
+                "math.max(t.height, 63)"
             ]
         }
     }

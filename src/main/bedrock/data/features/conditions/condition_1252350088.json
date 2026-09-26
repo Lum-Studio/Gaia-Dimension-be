@@ -4,7 +4,7 @@
         "description": {
             "identifier": "gaiadimension:conditions/condition_1252350088"
         },
-        "places_feature": "flakey:gen/blocks/water",
+        "places_feature": "gaiadimension:gen/blocks/mineral_water",
         "iterations": "t.layer < 1",
         "x": 0,
         "z": 0,

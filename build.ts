@@ -30,9 +30,12 @@ const SRC_RESOURCES = path.join(SRC_BEDROCK, 'resources');
 const SRC_TS = path.join(SRC_BEDROCK, 'ts');
 const BUILD_PATH = path.join(ROOT, 'build');
 
+const TSX_CLI = path.join(ROOT, 'node_modules/tsx/dist/cli.mjs');
+
 async function runCommand(cmd: string, description?: string) {
     if (description) console.log(`[INFO] ${description}...`);
-    execSync(cmd, { stdio: 'inherit', cwd: ROOT });
+    const formattedCmd = cmd.replace(/^npx tsx /, `"${process.execPath}" "${TSX_CLI}" `);
+    execSync(formattedCmd, { stdio: 'inherit', cwd: ROOT });
 }
 
 async function build() {

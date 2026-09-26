@@ -1,4 +1,5 @@
 import { world, system, Dimension, Vector3, Player, BlockPermutation, BlockVolume } from "@minecraft/server";
+import { generateSpawnTerrain } from "./GaiaChunkCoordinator.js";
 
 export const GAIA_DIMENSION_ID: string = "gaiadimension:gaia_dimension";
 
@@ -20,6 +21,15 @@ export class DimensionSystem {
     static getBiome(player: Player): string {
         try {
             const biome = player.dimension.getBiome(player.location);
+            return biome ? biome.id.replace("minecraft:", "").replace("gaiadimension:", "") : "crystal_plains";
+        } catch (e: unknown) {
+            return "crystal_plains";
+        }
+    }
+
+    static getBiomeAt(dimension: Dimension, location: Vector3): string {
+        try {
+            const biome = dimension.getBiome(location);
             return biome ? biome.id.replace("minecraft:", "").replace("gaiadimension:", "") : "crystal_plains";
         } catch (e: unknown) {
             return "crystal_plains";
@@ -48,6 +58,13 @@ export class DimensionSystem {
             from: { x: spawn.x - 8, y: 0, z: spawn.z - 8 },
             to: { x: spawn.x + 8, y: 128, z: spawn.z + 8 }
         });
+
+        // 1b. Pre-generate arrival chunks (5x5, radius = 2) before releasing player into Gaia Dimension
+        if (isToGaia) {
+            const targetChunkX = Math.floor(targetX / 16);
+            const targetChunkZ = Math.floor(targetZ / 16);
+            generateSpawnTerrain(targetDim, targetChunkX, targetChunkZ, 2);
+        }
 
         // 2. Build Arrival Portal & Platform
         const px: number = Math.floor(spawn.x);

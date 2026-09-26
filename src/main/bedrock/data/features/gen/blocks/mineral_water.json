@@ -2,9 +2,9 @@
 	"format_version": "1.20.20",
 	"minecraft:single_block_feature": {
 		"description": {
-			"identifier": "gaiadimension:gen/base/bedrock_picker"
+			"identifier": "gaiadimension:gen/blocks/mineral_water"
 		},
-		"places_block": "minecraft:bedrock",
+		"places_block": "gaiadimension:mineral_water",
 		"enforce_placement_rules": false,
 		"enforce_survivability_rules": false
 	}

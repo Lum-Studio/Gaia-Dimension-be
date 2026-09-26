@@ -6,7 +6,6 @@
         },
         "features": [
 			"gaiadimension:foliage/purple_tree_placement_test",
-			//"flakey:gen/blocks/air",
             "gaiadimension:foliage/purple_tree_offset"
         ],
         "early_out": "first_failure"

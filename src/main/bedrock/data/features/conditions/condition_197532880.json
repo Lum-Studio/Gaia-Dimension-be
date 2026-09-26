@@ -4,7 +4,7 @@
         "description": {
             "identifier": "gaiadimension:conditions/condition_197532880"
         },
-        "places_feature": "gaiadimension:gen/gaia_blocks/charred_grass",
+        "places_feature": "gaiadimension:gen/gaia_blocks/volcanic_rock",
         "iterations": "t.biome_id == 2",
         "x": 0,
         "z": 0,

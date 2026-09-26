@@ -4,7 +4,7 @@
         "description": {
             "identifier": "gaiadimension:conditions/condition_106920302"
         },
-        "places_feature": "gaiadimension:gen/gaia_blocks/impure_rock",
+        "places_feature": "gaiadimension:gen/gaia_blocks/wasteland_stone",
         "iterations": "t.biome_id == 5",
         "x": 0,
         "z": 0,

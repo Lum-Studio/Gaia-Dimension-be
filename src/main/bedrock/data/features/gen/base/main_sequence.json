@@ -5,7 +5,6 @@
             "identifier": "gaiadimension:gen/base/main_sequence"
         },
         "features": [
-            "flakey:gen/void/private/chunk_erase",
             "gaiadimension:gen/base/column_height",
             "gaiadimension:gen/caves/cave_layer_placer",
             "gaiadimension:gen/caves/magma_placer",
