@@ -4,7 +4,7 @@
 		"description": {
 			"identifier": "gaiadimension:gen/blocks/mineral_water"
 		},
-		"places_block": "gaiadimension:mineral_water",
+		"places_block": "minecraft:water",
 		"enforce_placement_rules": false,
 		"enforce_survivability_rules": false
 	}
